@@ -627,13 +627,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ee1c47aaa256ecabcaea351eae4a9b01ef39ed810004e298d2511ed284b1525"
 
 [[package]]
-name = "memmap"
-version = "0.7.0"
+name = "memmap2"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6585fd95e7bb50d6cc31e20d4cf9afb4e2ba16c5846fc76793f11218da9c475b"
+checksum = "d5172b50c23043ff43dd53e51392f36519d9b35a8f3a410d30ece5d1aedd58ae"
 dependencies = [
  "libc",
- "winapi",
 ]
 
 [[package]]
@@ -1106,12 +1105,12 @@ checksum = "8ea5119cdb4c55b55d432abb513a0429384878c15dde60cc77b1c99de1a95a6a"
 
 [[package]]
 name = "symbolic-common"
-version = "8.1.0"
+version = "8.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be7dfa630954f18297ceae1ff2890cb7f5008a0b2d2106b0468dafc45b0b6b12"
+checksum = "f551f902d5642e58039aee6a9021a61037926af96e071816361644983966f540"
 dependencies = [
  "debugid",
- "memmap",
+ "memmap2",
  "stable_deref_trait",
  "uuid",
 ]
