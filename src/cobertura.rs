@@ -1,3 +1,4 @@
+use crate::defs::*;
 use quick_xml::{
     events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event},
     Writer,
@@ -5,13 +6,13 @@ use quick_xml::{
 use rustc_hash::FxHashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
-    collections::BTreeSet,
+    fmt::Display,
     io::{BufWriter, Cursor, Write},
 };
+use std::{fmt::Formatter, path::Path};
 use symbolic_common::Name;
 use symbolic_demangle::{Demangle, DemangleOptions};
 
-use crate::defs::CovResultIter;
 use crate::output::get_target_output_writable;
 
 macro_rules! demangle {
@@ -33,12 +34,27 @@ struct Coverage {
     packages: Vec<Package>,
 }
 
+#[derive(Default)]
 struct CoverageStats {
     lines_covered: f64,
     lines_valid: f64,
     branches_covered: f64,
     branches_valid: f64,
     complexity: f64,
+}
+
+impl std::ops::Add for CoverageStats {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self {
+            lines_covered: self.lines_covered + rhs.lines_covered,
+            lines_valid: self.lines_valid + rhs.lines_valid,
+            branches_covered: self.branches_covered + rhs.branches_covered,
+            branches_valid: self.branches_valid + rhs.branches_valid,
+            complexity: self.complexity + rhs.complexity,
+        }
+    }
 }
 
 impl CoverageStats {
@@ -101,7 +117,14 @@ trait Stats {
 
 impl Stats for Coverage {
     fn get_lines(&self) -> FxHashMap<u32, Line> {
-        self.packages.get_lines()
+        unimplemented!("does not make sense to ask Coverage for lines")
+    }
+
+    fn get_stats(&self) -> CoverageStats {
+        self.packages
+            .iter()
+            .map(|p| p.get_stats())
+            .fold(CoverageStats::default(), |acc, stats| acc + stats)
     }
 }
 
@@ -175,10 +198,7 @@ impl Line {
     }
 
     fn covered(&self) -> bool {
-        match self {
-            Line::Plain { hits, .. } | Line::Branch { hits, .. } if *hits > 0 => true,
-            _ => false,
-        }
+        matches!(self, Line::Plain { hits, .. } | Line::Branch { hits, .. } if *hits > 0)
     }
 }
 
@@ -203,25 +223,24 @@ enum ConditionType {
     Jump,
 }
 
-impl ToString for ConditionType {
-    fn to_string(&self) -> String {
-        match *self {
-            Self::Jump => String::from("jump"),
+impl Display for ConditionType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Jump => write!(f, "jump"),
         }
     }
 }
 
 fn get_coverage(
-    results: CovResultIter,
+    results: &[ResultTuple],
+    sources: Vec<String>,
     demangle: bool,
     demangle_options: DemangleOptions,
 ) -> Coverage {
-    let sources = vec![".".to_owned()];
     let packages: Vec<Package> = results
+        .iter()
         .map(|(_, rel_path, result)| {
-            let all_lines: Vec<u32> = result.lines.iter().map(|(k, _)| k).cloned().collect();
-
-            let mut orphan_lines: BTreeSet<u32> = all_lines.iter().cloned().collect();
+            let all_lines: Vec<u32> = result.lines.keys().cloned().collect();
 
             let end: u32 = result.lines.keys().last().unwrap_or(&0) + 1;
 
@@ -231,13 +250,9 @@ fn get_coverage(
             }
             start_indexes.sort_unstable();
 
-            let functions = result.functions;
-            let result_lines = result.lines;
-            let result_branches = result.branches;
-
             let line_from_number = |number| {
-                let hits = result_lines.get(&number).cloned().unwrap_or_default();
-                if let Some(branches) = result_branches.get(&number) {
+                let hits = result.lines.get(&number).cloned().unwrap_or_default();
+                if let Some(branches) = result.branches.get(&number) {
                     let conditions = branches
                         .iter()
                         .enumerate()
@@ -257,7 +272,8 @@ fn get_coverage(
                 }
             };
 
-            let methods: Vec<Method> = functions
+            let methods: Vec<Method> = result
+                .functions
                 .iter()
                 .map(|(name, function)| {
                     let mut func_end = end;
@@ -275,7 +291,6 @@ fn get_coverage(
                         .filter(|&&x| x >= function.start && x < func_end)
                     {
                         lines_in_function.push(*line);
-                        orphan_lines.remove(line);
                     }
 
                     let lines: Vec<Line> = lines_in_function
@@ -291,7 +306,7 @@ fn get_coverage(
                 })
                 .collect();
 
-            let lines: Vec<Line> = orphan_lines.into_iter().map(line_from_number).collect();
+            let lines: Vec<Line> = all_lines.into_iter().map(line_from_number).collect();
             let class = Class {
                 name: rel_path
                     .file_stem()
@@ -313,23 +328,36 @@ fn get_coverage(
     Coverage { sources, packages }
 }
 
-pub fn output_cobertura(results: CovResultIter, output_file: Option<&str>, demangle: bool) {
+pub fn output_cobertura(
+    source_dir: Option<&Path>,
+    results: &[ResultTuple],
+    output_file: Option<&Path>,
+    demangle: bool,
+    pretty: bool,
+) {
     let demangle_options = DemangleOptions::name_only();
+    let sources = vec![source_dir
+        .unwrap_or_else(|| Path::new("."))
+        .display()
+        .to_string()];
+    let coverage = get_coverage(results, sources, demangle, demangle_options);
 
-    let coverage = get_coverage(results, demangle, demangle_options);
-
-    let mut writer = Writer::new_with_indent(Cursor::new(vec![]), b' ', 4);
+    let mut writer = if pretty {
+        Writer::new_with_indent(Cursor::new(vec![]), b' ', 4)
+    } else {
+        Writer::new(Cursor::new(vec![]))
+    };
     writer
-        .write_event(Event::Decl(BytesDecl::new(b"1.0", None, None)))
+        .write_event(Event::Decl(BytesDecl::new("1.0", None, None)))
         .unwrap();
     writer
-        .write_event(Event::DocType(BytesText::from_escaped_str(
+        .write_event(Event::DocType(BytesText::from_escaped(
             " coverage SYSTEM 'http://cobertura.sourceforge.net/xml/coverage-04.dtd'",
         )))
         .unwrap();
 
-    let cov_tag = b"coverage";
-    let mut cov = BytesStart::borrowed(cov_tag, cov_tag.len());
+    let cov_tag = "coverage";
+    let mut cov = BytesStart::from_content(cov_tag, cov_tag.len());
     let stats = coverage.get_stats();
     cov.push_attribute(("lines-covered", stats.lines_covered.to_string().as_ref()));
     cov.push_attribute(("lines-valid", stats.lines_valid.to_string().as_ref()));
@@ -352,43 +380,45 @@ pub fn output_cobertura(results: CovResultIter, output_file: Option<&str>, deman
     writer.write_event(Event::Start(cov)).unwrap();
 
     // export header
-    let sources_tag = b"sources";
-    let source_tag = b"source";
+    let sources_tag = "sources";
+    let source_tag = "source";
     writer
-        .write_event(Event::Start(BytesStart::borrowed(
+        .write_event(Event::Start(BytesStart::from_content(
             sources_tag,
             sources_tag.len(),
         )))
         .unwrap();
     for path in &coverage.sources {
         writer
-            .write_event(Event::Start(BytesStart::borrowed(
+            .write_event(Event::Start(BytesStart::from_content(
                 source_tag,
                 source_tag.len(),
             )))
             .unwrap();
-        writer.write(path.as_bytes()).unwrap();
         writer
-            .write_event(Event::End(BytesEnd::borrowed(source_tag)))
+            .write_event(Event::Text(BytesText::new(path)))
+            .unwrap();
+        writer
+            .write_event(Event::End(BytesEnd::new(source_tag)))
             .unwrap();
     }
     writer
-        .write_event(Event::End(BytesEnd::borrowed(sources_tag)))
+        .write_event(Event::End(BytesEnd::new(sources_tag)))
         .unwrap();
 
     // export packages
-    let packages_tag = b"packages";
-    let pack_tag = b"package";
+    let packages_tag = "packages";
+    let pack_tag = "package";
 
     writer
-        .write_event(Event::Start(BytesStart::borrowed(
+        .write_event(Event::Start(BytesStart::from_content(
             packages_tag,
             packages_tag.len(),
         )))
         .unwrap();
     // Export the package
     for package in &coverage.packages {
-        let mut pack = BytesStart::borrowed(pack_tag, pack_tag.len());
+        let mut pack = BytesStart::from_content(pack_tag, pack_tag.len());
         pack.push_attribute(("name", package.name.as_ref()));
         let stats = package.get_stats();
         pack.push_attribute(("line-rate", stats.line_rate().to_string().as_ref()));
@@ -398,20 +428,20 @@ pub fn output_cobertura(results: CovResultIter, output_file: Option<&str>, deman
         writer.write_event(Event::Start(pack)).unwrap();
 
         // export_classes
-        let classes_tag = b"classes";
-        let class_tag = b"class";
-        let methods_tag = b"methods";
-        let method_tag = b"method";
+        let classes_tag = "classes";
+        let class_tag = "class";
+        let methods_tag = "methods";
+        let method_tag = "method";
 
         writer
-            .write_event(Event::Start(BytesStart::borrowed(
+            .write_event(Event::Start(BytesStart::from_content(
                 classes_tag,
                 classes_tag.len(),
             )))
             .unwrap();
 
         for class in &package.classes {
-            let mut c = BytesStart::borrowed(class_tag, class_tag.len());
+            let mut c = BytesStart::from_content(class_tag, class_tag.len());
             c.push_attribute(("name", class.name.as_ref()));
             c.push_attribute(("filename", class.file_name.as_ref()));
             let stats = class.get_stats();
@@ -421,14 +451,14 @@ pub fn output_cobertura(results: CovResultIter, output_file: Option<&str>, deman
 
             writer.write_event(Event::Start(c)).unwrap();
             writer
-                .write_event(Event::Start(BytesStart::borrowed(
+                .write_event(Event::Start(BytesStart::from_content(
                     methods_tag,
                     methods_tag.len(),
                 )))
                 .unwrap();
 
             for method in &class.methods {
-                let mut m = BytesStart::borrowed(method_tag, method_tag.len());
+                let mut m = BytesStart::from_content(method_tag, method_tag.len());
                 m.push_attribute(("name", method.name.as_ref()));
                 m.push_attribute(("signature", method.signature.as_ref()));
                 let stats = method.get_stats();
@@ -439,31 +469,31 @@ pub fn output_cobertura(results: CovResultIter, output_file: Option<&str>, deman
 
                 write_lines(&mut writer, &method.lines);
                 writer
-                    .write_event(Event::End(BytesEnd::borrowed(method_tag)))
+                    .write_event(Event::End(BytesEnd::new(method_tag)))
                     .unwrap();
             }
             writer
-                .write_event(Event::End(BytesEnd::borrowed(methods_tag)))
+                .write_event(Event::End(BytesEnd::new(methods_tag)))
                 .unwrap();
             write_lines(&mut writer, &class.lines);
         }
         writer
-            .write_event(Event::End(BytesEnd::borrowed(class_tag)))
+            .write_event(Event::End(BytesEnd::new(class_tag)))
             .unwrap();
         writer
-            .write_event(Event::End(BytesEnd::borrowed(classes_tag)))
+            .write_event(Event::End(BytesEnd::new(classes_tag)))
             .unwrap();
         writer
-            .write_event(Event::End(BytesEnd::borrowed(pack_tag)))
+            .write_event(Event::End(BytesEnd::new(pack_tag)))
             .unwrap();
     }
 
     writer
-        .write_event(Event::End(BytesEnd::borrowed(packages_tag)))
+        .write_event(Event::End(BytesEnd::new(packages_tag)))
         .unwrap();
 
     writer
-        .write_event(Event::End(BytesEnd::borrowed(cov_tag)))
+        .write_event(Event::End(BytesEnd::new(cov_tag)))
         .unwrap();
 
     let result = writer.into_inner().into_inner();
@@ -472,17 +502,17 @@ pub fn output_cobertura(results: CovResultIter, output_file: Option<&str>, deman
 }
 
 fn write_lines(writer: &mut Writer<Cursor<Vec<u8>>>, lines: &[Line]) {
-    let lines_tag = b"lines";
-    let line_tag = b"line";
+    let lines_tag = "lines";
+    let line_tag = "line";
 
     writer
-        .write_event(Event::Start(BytesStart::borrowed(
+        .write_event(Event::Start(BytesStart::from_content(
             lines_tag,
             lines_tag.len(),
         )))
         .unwrap();
     for line in lines {
-        let mut l = BytesStart::borrowed(line_tag, line_tag.len());
+        let mut l = BytesStart::from_content(line_tag, line_tag.len());
         match line {
             Line::Plain {
                 ref number,
@@ -490,7 +520,7 @@ fn write_lines(writer: &mut Writer<Cursor<Vec<u8>>>, lines: &[Line]) {
             } => {
                 l.push_attribute(("number", number.to_string().as_ref()));
                 l.push_attribute(("hits", hits.to_string().as_ref()));
-                writer.write_event(Event::Start(l)).unwrap();
+                writer.write_event(Event::Empty(l)).unwrap();
             }
             Line::Branch {
                 ref number,
@@ -502,75 +532,63 @@ fn write_lines(writer: &mut Writer<Cursor<Vec<u8>>>, lines: &[Line]) {
                 l.push_attribute(("branch", "true"));
                 writer.write_event(Event::Start(l)).unwrap();
 
-                let conditions_tag = b"conditions";
-                let condition_tag = b"condition";
+                let conditions_tag = "conditions";
+                let condition_tag = "condition";
 
                 writer
-                    .write_event(Event::Start(BytesStart::borrowed(
+                    .write_event(Event::Start(BytesStart::from_content(
                         conditions_tag,
                         conditions_tag.len(),
                     )))
                     .unwrap();
                 for condition in conditions {
-                    let mut c = BytesStart::borrowed(condition_tag, condition_tag.len());
+                    let mut c = BytesStart::from_content(condition_tag, condition_tag.len());
                     c.push_attribute(("number", condition.number.to_string().as_ref()));
                     c.push_attribute(("type", condition.cond_type.to_string().as_ref()));
                     c.push_attribute(("coverage", condition.coverage.to_string().as_ref()));
                     writer.write_event(Event::Empty(c)).unwrap();
                 }
                 writer
-                    .write_event(Event::End(BytesEnd::borrowed(conditions_tag)))
+                    .write_event(Event::End(BytesEnd::new(conditions_tag)))
+                    .unwrap();
+                writer
+                    .write_event(Event::End(BytesEnd::new(line_tag)))
                     .unwrap();
             }
         }
-        writer
-            .write_event(Event::End(BytesEnd::borrowed(line_tag)))
-            .unwrap();
     }
     writer
-        .write_event(Event::End(BytesEnd::borrowed(lines_tag)))
+        .write_event(Event::End(BytesEnd::new(lines_tag)))
         .unwrap();
 }
 
 #[cfg(test)]
 mod tests {
-    extern crate tempfile;
     use super::*;
     use crate::{CovResult, Function};
-    use std::fs::File;
     use std::io::Read;
     use std::{collections::BTreeMap, path::PathBuf};
+    use std::{fs::File, path::Path};
 
-    fn read_file(path: &PathBuf) -> String {
-        let mut f =
-            File::open(path).expect(format!("{:?} file not found", path.file_name()).as_str());
-        let mut s = String::new();
-        f.read_to_string(&mut s).unwrap();
-        s
+    enum Result {
+        Main,
+        Test,
     }
 
-    #[test]
-    fn test_cobertura() {
-        /* main.rs
-        fn main() {
-            let inp = "a";
-            if "a" == inp {
-                println!("a");
-            } else if "b" == inp {
-                println!("b");
-            }
-            println!("what?");
-        }
-        */
-
-        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-        let file_name = "test_cobertura.xml";
-        let file_path = tmp_dir.path().join(&file_name);
-
-        let results = vec![(
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("src/main.rs"),
-            CovResult {
+    fn coverage_result(which: Result) -> CovResult {
+        match which {
+            Result::Main => CovResult {
+                /* main.rs
+                  fn main() {
+                      let inp = "a";
+                      if "a" == inp {
+                          println!("a");
+                      } else if "b" == inp {
+                          println!("b");
+                      }
+                      println!("what?");
+                  }
+                */
                 lines: [
                     (1, 1),
                     (2, 1),
@@ -602,53 +620,20 @@ mod tests {
                     map
                 },
             },
-        )];
+            Result::Test => CovResult {
+                /* main.rs
+                   fn main() {
+                   }
 
-        let results = Box::new(results.into_iter());
-        output_cobertura(results, Some(file_path.to_str().unwrap()), true);
-
-        let results = read_file(&file_path);
-
-        assert!(results.contains(r#"package name="src/main.rs""#));
-        assert!(results.contains(r#"class name="main" filename="src/main.rs""#));
-        assert!(results.contains(r#"method name="cov_test::main""#));
-        assert!(results.contains(r#"line number="1" hits="1">"#));
-        assert!(results.contains(r#"line number="3" hits="2" branch="true""#));
-        assert!(results.contains(r#"<condition number="0" type="jump" coverage="1"/>"#));
-
-        assert!(results.contains(r#"lines-covered="6""#));
-        assert!(results.contains(r#"lines-valid="8""#));
-        assert!(results.contains(r#"line-rate="0.75""#));
-
-        assert!(results.contains(r#"branches-covered="1""#));
-        assert!(results.contains(r#"branches-valid="4""#));
-        assert!(results.contains(r#"branch-rate="0.25""#));
-    }
-
-    #[test]
-    fn test_cobertura_double_lines() {
-        /* main.rs
-        fn main() {
-        }
-
-        #[test]
-        fn test_fn() {
-            let s = "s";
-            if s == "s" {
-                println!("test");
-            }
-            println!("test");
-        }
-        */
-
-        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-        let file_name = "test_cobertura.xml";
-        let file_path = tmp_dir.path().join(&file_name);
-
-        let results = vec![(
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("src/main.rs"),
-            CovResult {
+                   #[test]
+                   fn test_fn() {
+                       let s = "s";
+                       if s == "s" {
+                           println!("test");
+                       }
+                       println!("test");
+                   }
+                */
                 lines: [
                     (1, 2),
                     (3, 0),
@@ -712,12 +697,70 @@ mod tests {
                     map
                 },
             },
+        }
+    }
+
+    fn read_file(path: &Path) -> String {
+        let mut f =
+            File::open(path).unwrap_or_else(|_| panic!("{:?} file not found", path.file_name()));
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn test_cobertura() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let file_name = "test_cobertura.xml";
+        let file_path = tmp_dir.path().join(file_name);
+
+        let results = vec![(
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("src/main.rs"),
+            coverage_result(Result::Main),
         )];
 
-        let results = Box::new(results.into_iter());
-        output_cobertura(results, Some(file_path.to_str().unwrap()), true);
+        for pretty in [false, true] {
+            output_cobertura(None, &results, Some(&file_path), true, pretty);
+
+            let results = read_file(&file_path);
+
+            assert!(results.contains(r#"<source>.</source>"#));
+
+            assert!(results.contains(r#"package name="src/main.rs""#));
+            assert!(results.contains(r#"class name="main" filename="src/main.rs""#));
+            assert!(results.contains(r#"method name="cov_test::main""#));
+            assert!(results.contains(r#"line number="1" hits="1"/>"#));
+            assert!(results.contains(r#"line number="3" hits="2" branch="true""#));
+            assert!(results.contains(r#"<condition number="0" type="jump" coverage="1"/>"#));
+
+            assert!(results.contains(r#"lines-covered="6""#));
+            assert!(results.contains(r#"lines-valid="8""#));
+            assert!(results.contains(r#"line-rate="0.75""#));
+
+            assert!(results.contains(r#"branches-covered="1""#));
+            assert!(results.contains(r#"branches-valid="4""#));
+            assert!(results.contains(r#"branch-rate="0.25""#));
+        }
+    }
+
+    #[test]
+    fn test_cobertura_double_lines() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let file_name = "test_cobertura.xml";
+        let file_path = tmp_dir.path().join(file_name);
+
+        let results = vec![(
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("src/main.rs"),
+            coverage_result(Result::Test),
+        )];
+
+        output_cobertura(None, &results, Some(file_path.as_ref()), true, true);
 
         let results = read_file(&file_path);
+
+        assert!(results.contains(r#"<source>.</source>"#));
 
         assert!(results.contains(r#"package name="src/main.rs""#));
         assert!(results.contains(r#"class name="main" filename="src/main.rs""#));
@@ -731,5 +774,90 @@ mod tests {
         assert!(results.contains(r#"branches-covered="1""#));
         assert!(results.contains(r#"branches-valid="2""#));
         assert!(results.contains(r#"branch-rate="0.5""#));
+    }
+
+    #[test]
+    fn test_cobertura_multiple_files() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let file_name = "test_cobertura.xml";
+        let file_path = tmp_dir.path().join(file_name);
+
+        let results = vec![
+            (
+                PathBuf::from("src/main.rs"),
+                PathBuf::from("src/main.rs"),
+                coverage_result(Result::Main),
+            ),
+            (
+                PathBuf::from("src/test.rs"),
+                PathBuf::from("src/test.rs"),
+                coverage_result(Result::Test),
+            ),
+        ];
+
+        output_cobertura(None, &results, Some(file_path.as_ref()), true, true);
+
+        let results = read_file(&file_path);
+
+        assert!(results.contains(r#"<source>.</source>"#));
+
+        assert!(results.contains(r#"package name="src/main.rs""#));
+        assert!(results.contains(r#"class name="main" filename="src/main.rs""#));
+        assert!(results.contains(r#"package name="src/test.rs""#));
+        assert!(results.contains(r#"class name="test" filename="src/test.rs""#));
+
+        assert!(results.contains(r#"lines-covered="13""#));
+        assert!(results.contains(r#"lines-valid="16""#));
+        assert!(results.contains(r#"line-rate="0.8125""#));
+
+        assert!(results.contains(r#"branches-covered="2""#));
+        assert!(results.contains(r#"branches-valid="6""#));
+        assert!(results.contains(r#"branch-rate="0.3333333333333333""#));
+    }
+
+    #[test]
+    fn test_cobertura_source_root_none() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let file_name = "test_cobertura.xml";
+        let file_path = tmp_dir.path().join(file_name);
+
+        let results = vec![(
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("src/main.rs"),
+            CovResult::default(),
+        )];
+
+        output_cobertura(None, &results, Some(&file_path), true, true);
+
+        let results = read_file(&file_path);
+
+        assert!(results.contains(r#"<source>.</source>"#));
+        assert!(results.contains(r#"package name="src/main.rs""#));
+    }
+
+    #[test]
+    fn test_cobertura_source_root_some() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let file_name = "test_cobertura.xml";
+        let file_path = tmp_dir.path().join(file_name);
+
+        let results = vec![(
+            PathBuf::from("main.rs"),
+            PathBuf::from("main.rs"),
+            CovResult::default(),
+        )];
+
+        output_cobertura(
+            Some(Path::new("src")),
+            &results,
+            Some(&file_path),
+            true,
+            true,
+        );
+
+        let results = read_file(&file_path);
+
+        assert!(results.contains(r#"<source>src</source>"#));
+        assert!(results.contains(r#"package name="main.rs""#));
     }
 }

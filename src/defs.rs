@@ -1,4 +1,4 @@
-use crossbeam::channel::{Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use rustc_hash::FxHashMap;
 use serde::ser::{Serialize, Serializer};
 use std::cell::RefCell;
@@ -8,26 +8,25 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Mutex;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Function {
     pub start: u32,
     pub executed: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CovResult {
     pub lines: BTreeMap<u32, u64>,
     pub branches: BTreeMap<u32, Vec<bool>>,
     pub functions: FunctionMap,
 }
 
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[allow(non_camel_case_types)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum ItemFormat {
-    GCNO,
-    PROFRAW,
-    INFO,
-    JACOCO_XML,
+    Gcno,
+    Profraw,
+    Info,
+    JacocoXml,
 }
 
 #[derive(Debug)]
@@ -59,7 +58,7 @@ pub type JobSender = Sender<Option<WorkItem>>;
 
 pub type CovResultMap = FxHashMap<String, CovResult>;
 pub type SyncCovResultMap = Mutex<CovResultMap>;
-pub type CovResultIter = Box<dyn Iterator<Item = (PathBuf, PathBuf, CovResult)>>;
+pub type ResultTuple = (PathBuf, PathBuf, CovResult);
 
 #[derive(Debug, Default)]
 pub struct CDStats {
@@ -76,7 +75,7 @@ pub struct CDFileStats {
     pub coverage: Vec<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct CDDirStats {
     pub name: String,
     pub files: Vec<CDFileStats>,
@@ -127,7 +126,7 @@ pub enum StringOrRef<'a> {
 }
 
 impl<'a> Display for StringOrRef<'a> {
-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             StringOrRef::S(s) => write!(f, "{}", s),
             StringOrRef::R(s) => write!(f, "{}", s),
@@ -145,4 +144,9 @@ impl<'a> Serialize for StringOrRef<'a> {
             StringOrRef::R(s) => serializer.serialize_str(s),
         }
     }
+}
+
+pub struct JacocoReport {
+    pub lines: BTreeMap<u32, u64>,
+    pub branches: BTreeMap<u32, Vec<bool>>,
 }

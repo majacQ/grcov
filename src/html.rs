@@ -1,11 +1,11 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::{from_value, to_value, Value};
-use std::array;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::{btree_map, BTreeMap};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tera::try_get_value;
@@ -35,25 +35,50 @@ pub struct Config {
     date: DateTime<Utc>,
 }
 
-static BULMA_VERSION: &'static str = "0.9.1";
+impl Config {
+    fn new(cfg: &ConfigFile) -> Config {
+        Config {
+            hi_limit: cfg.hi_limit.unwrap_or(90.),
+            med_limit: cfg.med_limit.unwrap_or(75.),
+            fn_hi_limit: cfg.fn_hi_limit.unwrap_or(90.),
+            fn_med_limit: cfg.fn_med_limit.unwrap_or(75.),
+            branch_hi_limit: cfg.branch_hi_limit.unwrap_or(90.),
+            branch_med_limit: cfg.branch_med_limit.unwrap_or(75.),
+            date: Utc::now(),
+        }
+    }
+}
 
-pub fn get_config() -> (Tera, Config) {
-    let conf = Config {
-        hi_limit: 90.,
-        med_limit: 75.,
-        fn_hi_limit: 90.,
-        fn_med_limit: 75.,
-        branch_hi_limit: 90.,
-        branch_med_limit: 75.,
-        date: Utc::now(),
-    };
+#[derive(Deserialize, Debug, Default)]
+pub struct ConfigFile {
+    hi_limit: Option<f64>,
+    med_limit: Option<f64>,
+    fn_hi_limit: Option<f64>,
+    fn_med_limit: Option<f64>,
+    branch_hi_limit: Option<f64>,
+    branch_med_limit: Option<f64>,
+    templates: Option<HashMap<String, String>>,
+}
 
-    let mut tera = Tera::default();
+impl ConfigFile {
+    fn load(config: Option<&Path>) -> ConfigFile {
+        if let Some(path) = config {
+            let file = File::open(path).unwrap();
+            let reader = BufReader::new(file);
+            serde_json::from_reader(reader).unwrap()
+        } else {
+            Default::default()
+        }
+    }
+}
 
-    tera.register_filter("severity", conf.clone());
-    tera.register_function("percent", &percent);
+static BULMA_VERSION: &str = "0.9.1";
 
-    tera.add_raw_templates(vec![
+fn load_template(path: &str) -> String {
+    fs::read_to_string(path).unwrap()
+}
+fn get_templates(user_templates: &Option<HashMap<String, String>>) -> HashMap<String, String> {
+    let mut result: HashMap<String, String> = HashMap::from([
         ("macros.html", include_str!("templates/macros.html")),
         ("base.html", include_str!("templates/base.html")),
         ("index.html", include_str!("templates/index.html")),
@@ -79,7 +104,31 @@ pub fn get_config() -> (Tera, Config) {
             include_str!("templates/badges/social.svg"),
         ),
     ])
-    .unwrap();
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+
+    if let Some(user_templates) = user_templates {
+        let user_templates: HashMap<String, String> = user_templates
+            .iter()
+            .map(|(k, v)| (k.to_owned(), load_template(v)))
+            .collect();
+        result.extend(user_templates);
+    }
+    result
+}
+
+pub fn get_config(output_config_file: Option<&Path>) -> (Tera, Config) {
+    let user_conf = ConfigFile::load(output_config_file);
+    let conf = Config::new(&user_conf);
+
+    let mut tera = Tera::default();
+
+    tera.register_filter("severity", conf.clone());
+    tera.register_function("percent", percent);
+
+    tera.add_raw_templates(get_templates(&user_conf.templates))
+        .unwrap();
 
     (tera, conf)
 }
@@ -113,14 +162,14 @@ impl tera::Filter for Config {
     }
 }
 
-fn create_parent(path: &PathBuf) {
+fn create_parent(path: &Path) {
     let dest_parent = path.parent().unwrap();
     if !dest_parent.exists() && fs::create_dir_all(dest_parent).is_err() {
         panic!("Cannot create parent directory: {:?}", dest_parent);
     }
 }
 
-fn add_html_ext(path: &PathBuf) -> PathBuf {
+fn add_html_ext(path: &Path) -> PathBuf {
     if let Some(ext) = path.extension() {
         let mut ext = ext.to_str().unwrap().to_owned();
         ext.push_str(".html");
@@ -153,11 +202,13 @@ fn get_stats(result: &CovResult) -> HtmlStats {
 }
 
 #[inline(always)]
-fn get_percentage(x: usize, y: usize) -> f64 {
-    if y != 0 {
-        (x as f64) / (y as f64) * 100.
+fn get_percentage_of_covered_lines(covered_lines: usize, total_lines: usize) -> f64 {
+    if total_lines != 0 {
+        covered_lines as f64 / total_lines as f64 * 100.0
     } else {
-        0.0
+        // If the file is empty (no lines) then the coverage
+        // must be 100% (0% means "bad" which is not the case).
+        100.0
     }
 }
 
@@ -167,7 +218,7 @@ fn percent(args: &HashMap<String, Value>) -> tera::Result<Value> {
             from_value::<usize>(n.clone()),
             from_value::<usize>(d.clone()),
         ) {
-            Ok(to_value(get_percentage(num, den)).unwrap())
+            Ok(to_value(get_percentage_of_covered_lines(num, den)).unwrap())
         } else {
             Err(tera::Error::msg("Invalid arguments"))
         }
@@ -176,12 +227,12 @@ fn percent(args: &HashMap<String, Value>) -> tera::Result<Value> {
     }
 }
 
-fn get_base(rel_path: &PathBuf) -> String {
+fn get_base(rel_path: &Path) -> String {
     let count = rel_path.components().count() - 1 /* -1 for the file itself */;
-    "../".repeat(count).to_string()
+    "../".repeat(count)
 }
 
-fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &PathBuf, stats: &HtmlStats) {
+fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &Path, stats: &HtmlStats) {
     let parent = rel_path.parent().unwrap().to_str().unwrap().to_string();
     let file_name = rel_path.file_name().unwrap().to_str().unwrap().to_string();
     let fs = HtmlFileStats {
@@ -189,7 +240,8 @@ fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &PathBuf, stat
     };
     let mut global = global.lock().unwrap();
     global.stats.add(stats);
-    match global.dirs.entry(parent) {
+    let entry = global.dirs.entry(parent);
+    match entry {
         btree_map::Entry::Occupied(ds) => {
             let ds = ds.into_mut();
             ds.stats.add(stats);
@@ -220,8 +272,9 @@ pub fn gen_index(
     tera: &Tera,
     global: &HtmlGlobalStats,
     conf: &Config,
-    output: &PathBuf,
+    output: &Path,
     branch_enabled: bool,
+    precision: usize,
 ) {
     let output_file = output.join("index.html");
     create_parent(&output_file);
@@ -239,6 +292,7 @@ pub fn gen_index(
     ctx.insert("current", "top_level");
     ctx.insert("parents", empty);
     ctx.insert("stats", &global.stats);
+    ctx.insert("precision", &precision);
     ctx.insert("items", &global.dirs);
     ctx.insert("kind", "Directory");
     ctx.insert("branch_enabled", &branch_enabled);
@@ -251,7 +305,15 @@ pub fn gen_index(
     }
 
     for (dir_name, dir_stats) in global.dirs.iter() {
-        gen_dir_index(&tera, dir_name, dir_stats, &conf, output, branch_enabled);
+        gen_dir_index(
+            tera,
+            dir_name,
+            dir_stats,
+            conf,
+            output,
+            branch_enabled,
+            precision,
+        );
     }
 }
 
@@ -260,11 +322,14 @@ pub fn gen_dir_index(
     dir_name: &str,
     dir_stats: &HtmlDirStats,
     conf: &Config,
-    output: &PathBuf,
+    output: &Path,
     branch_enabled: bool,
+    precision: usize,
 ) {
-    let index = PathBuf::from(dir_name).join("index.html");
-    let output_file = output.join(&index);
+    let index = Path::new(dir_name).join("index.html");
+    let layers = index.components().count() - 1;
+    let prefix = "../".repeat(layers) + "index.html";
+    let output_file = output.join(index);
     create_parent(&output_file);
     let mut output = match File::create(&output_file) {
         Err(_) => {
@@ -278,11 +343,12 @@ pub fn gen_dir_index(
     ctx.insert("date", &conf.date);
     ctx.insert("bulma_version", BULMA_VERSION);
     ctx.insert("current", dir_name);
-    ctx.insert("parents", &[("../index.html", "top_level")]);
+    ctx.insert("parents", &[(prefix, "top_level")]);
     ctx.insert("stats", &dir_stats.stats);
     ctx.insert("items", &dir_stats.files);
     ctx.insert("kind", "File");
     ctx.insert("branch_enabled", &branch_enabled);
+    ctx.insert("precision", &precision);
 
     let out = tera.render("index.html", &ctx).unwrap();
 
@@ -293,31 +359,31 @@ pub fn gen_dir_index(
 
 fn gen_html(
     tera: &Tera,
-    path: PathBuf,
+    path: &Path,
     result: &CovResult,
     conf: &Config,
-    output: &PathBuf,
-    rel_path: &PathBuf,
+    output: &Path,
+    rel_path: &Path,
     global: Arc<Mutex<HtmlGlobalStats>>,
     branch_enabled: bool,
+    precision: usize,
 ) {
     if !rel_path.is_relative() {
         return;
     }
 
-    let f = match File::open(&path) {
+    let mut f = match File::open(path) {
         Err(_) => {
             //eprintln!("Warning: cannot open file {:?}", path);
             return;
         }
         Ok(f) => f,
     };
-    let f = BufReader::new(f);
 
-    let stats = get_stats(&result);
-    get_dirs_result(global, &rel_path, &stats);
+    let stats = get_stats(result);
+    get_dirs_result(global, rel_path, &stats);
 
-    let output_file = output.join(add_html_ext(&rel_path));
+    let output_file = output.join(add_html_ext(rel_path));
     create_parent(&output_file);
     let mut output = match File::create(&output_file) {
         Err(_) => {
@@ -326,10 +392,10 @@ fn gen_html(
         }
         Ok(f) => f,
     };
-    let base_url = get_base(&rel_path);
+    let base_url = get_base(rel_path);
     let filename = rel_path.file_name().unwrap().to_str().unwrap();
     let parent = rel_path.parent().unwrap().to_str().unwrap().to_string();
-    let mut index_url = base_url.clone();
+    let mut index_url = base_url;
     index_url.push_str("index.html");
 
     let mut ctx = make_context();
@@ -345,8 +411,24 @@ fn gen_html(
     );
     ctx.insert("stats", &stats);
     ctx.insert("branch_enabled", &branch_enabled);
+    ctx.insert("precision", &precision);
 
-    let items = f
+    let mut file_buf = Vec::new();
+    if let Err(e) = f.read_to_end(&mut file_buf) {
+        eprintln!("Failed to read {}: {}", path.display(), e);
+        return;
+    }
+
+    let file_utf8 = String::from_utf8_lossy(&file_buf);
+    if matches!(&file_utf8, Cow::Owned(_)) {
+        // from_utf8_lossy needs to reallocate only when invalid UTF-8, warn.
+        eprintln!(
+            "Warning: invalid utf-8 characters in source file {}. They will be replaced by U+FFFD",
+            path.display()
+        );
+    }
+
+    let items = file_utf8
         .lines()
         .enumerate()
         .map(move |(i, l)| {
@@ -357,7 +439,7 @@ fn gen_html(
                 .map(|&v| v as i64)
                 .unwrap_or(-1);
 
-            (index, count, l.unwrap())
+            (index, count, l)
         })
         .collect::<Vec<_>>();
 
@@ -374,9 +456,10 @@ pub fn consumer_html(
     tera: &Tera,
     receiver: HtmlJobReceiver,
     global: Arc<Mutex<HtmlGlobalStats>>,
-    output: PathBuf,
+    output: &Path,
     conf: Config,
     branch_enabled: bool,
+    precision: usize,
 ) {
     while let Ok(job) = receiver.recv() {
         if job.is_none() {
@@ -385,13 +468,14 @@ pub fn consumer_html(
         let job = job.unwrap();
         gen_html(
             tera,
-            job.abs_path,
+            &job.abs_path,
             &job.result,
             &conf,
-            &output,
+            output,
             &job.rel_path,
             global.clone(),
             branch_enabled,
+            precision,
         );
     }
 }
@@ -431,13 +515,15 @@ impl BadgeStyle {
 
     /// Create an iterator over all possible values of this enum.
     pub fn iter() -> impl Iterator<Item = Self> {
-        array::IntoIter::new([
+        [
             Self::Flat,
             Self::FlatSquare,
             Self::ForTheBadge,
             Self::Plastic,
             Self::Social,
-        ])
+        ]
+        .iter()
+        .copied()
     }
 }
 
@@ -455,7 +541,10 @@ pub fn gen_badge(tera: &Tera, stats: &HtmlStats, conf: &Config, output: &Path, s
     };
 
     let mut ctx = make_context();
-    ctx.insert("current", &(stats.covered_lines * 100 / stats.total_lines));
+    ctx.insert(
+        "current",
+        &(get_percentage_of_covered_lines(stats.covered_lines, stats.total_lines) as usize),
+    );
     ctx.insert("hi_limit", &conf.hi_limit);
     ctx.insert("med_limit", &conf.med_limit);
 
@@ -479,7 +568,7 @@ pub fn gen_badge(tera: &Tera, stats: &HtmlStats, conf: &Config, output: &Path, s
 ///
 /// `<username>` and `<project>` should be replaced with a real username and project name
 /// respectively, for the URL to work.
-pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path) {
+pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path, precision: usize) {
     #[derive(Serialize)]
     #[serde(rename_all = "camelCase")]
     struct CoverageData {
@@ -499,17 +588,17 @@ pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path) {
         Ok(f) => f,
     };
 
-    let coverage = stats.covered_lines * 100 / stats.total_lines;
+    let coverage = get_percentage_of_covered_lines(stats.covered_lines, stats.total_lines);
 
     let res = serde_json::to_writer(
         &mut output_stream,
         &CoverageData {
             schema_version: 1,
             label: "coverage",
-            message: format!("{}%", coverage),
-            color: if coverage as f64 >= conf.hi_limit {
+            message: format!("{:.precision$}%", coverage),
+            color: if coverage >= conf.hi_limit {
                 "green"
-            } else if coverage as f64 >= conf.med_limit {
+            } else if coverage >= conf.med_limit {
                 "yellow"
             } else {
                 "red"
@@ -519,5 +608,19 @@ pub fn gen_coverage_json(stats: &HtmlStats, conf: &Config, output: &Path) {
 
     if res.is_err() {
         eprintln!("cannot write the file {:?}", output_file);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_percentage_of_covered_lines;
+
+    #[test]
+    fn test_get_percentage_of_covered_lines() {
+        assert_eq!(get_percentage_of_covered_lines(5, 5), 100.0);
+        assert_eq!(get_percentage_of_covered_lines(1, 2), 50.0);
+        assert_eq!(get_percentage_of_covered_lines(200, 500), 40.0);
+        assert_eq!(get_percentage_of_covered_lines(0, 0), 100.0);
+        assert_eq!(get_percentage_of_covered_lines(5, 0), 100.0);
     }
 }

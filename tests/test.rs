@@ -1,9 +1,3 @@
-extern crate globset;
-extern crate regex;
-extern crate serde_json;
-extern crate walkdir;
-extern crate zip;
-
 use globset::{Glob, GlobSetBuilder};
 use regex::Regex;
 use serde_json::Value;
@@ -13,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{env, fs};
 use walkdir::WalkDir;
-use zip::write::FileOptions;
+use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
 fn get_tool(name: &str, default: &str) -> String {
@@ -33,10 +27,10 @@ fn make(path: &Path, compiler: &str) {
         glob_builder.add(Glob::new(c_cpp_glob).unwrap());
     }
     let c_cpp_globset = glob_builder.build().unwrap();
-    for entry in WalkDir::new(&path) {
+    for entry in WalkDir::new(path) {
         let entry = entry.expect("Failed to open directory.");
 
-        if c_cpp_globset.is_match(&entry.file_name()) {
+        if c_cpp_globset.is_match(entry.file_name()) {
             args.push(entry.file_name().to_os_string());
         }
     }
@@ -65,11 +59,15 @@ fn run(path: &Path) {
         .status()
         .expect("Failed to run");
     assert!(status.success());
+
+    // Clean profraw files after running the binary, or grcov will think source-based coverage was used.
+    rm_files(path, vec!["*.profraw"]);
 }
 
 fn read_file(path: &Path) -> String {
     println!("Read file: {:?}", path);
-    let mut f = File::open(path).expect(format!("{:?} file not found", path.file_name()).as_str());
+    let mut f =
+        File::open(path).unwrap_or_else(|_| panic!("{:?} file not found", path.file_name()));
     let mut s = String::new();
     f.read_to_string(&mut s).unwrap();
     s
@@ -90,14 +88,7 @@ fn read_expected(
         "linux"
     };
 
-    let base_name = format!(
-        "expected{}",
-        if let Some(additional) = additional {
-            additional
-        } else {
-            ""
-        }
-    );
+    let base_name = format!("expected{}", additional.unwrap_or_default());
 
     let name_with_ver_and_os = format!(
         "{}_{}_{}_{}.{}",
@@ -119,7 +110,7 @@ fn read_expected(
             }
         }
     };
-    read_file(&path.join(&name))
+    read_file(&path.join(name))
 }
 
 /// Returns the path to grcov executable.
@@ -186,10 +177,10 @@ fn rm_files(directory: &Path, file_globs: Vec<&str>) {
     }
     let to_remove_globset = glob_builder.build().unwrap();
 
-    for entry in WalkDir::new(&directory) {
+    for entry in WalkDir::new(directory) {
         let entry = entry.expect("Failed to open directory.");
 
-        if to_remove_globset.is_match(&entry.file_name()) {
+        if to_remove_globset.is_match(entry.file_name()) {
             fs::remove_file(entry.path()).unwrap();
         }
     }
@@ -198,14 +189,7 @@ fn rm_files(directory: &Path, file_globs: Vec<&str>) {
 fn do_clean(directory: &Path) {
     rm_files(
         directory,
-        vec![
-            "a.out",
-            "a.exe",
-            "*.gcno",
-            "*.gcda",
-            "*.zip",
-            "default.profraw",
-        ],
+        vec!["a.out", "a.exe", "*.gcno", "*.gcda", "*.zip", "*.profraw"],
     );
 }
 
@@ -235,7 +219,7 @@ fn check_equal_ade(expected_output: &str, output: &str) {
     let mut actual: Vec<Value> = Vec::new();
     for line in output.lines() {
         let parsed = serde_json::from_str(line).unwrap();
-        println!("{}", serde_json::to_string_pretty(&parsed).unwrap());
+        println!("{}", parsed);
         actual.push(parsed);
     }
 
@@ -374,7 +358,7 @@ fn check_equal_covdir(expected_output: &str, output: &str) {
 
     println!("{}", serde_json::to_string_pretty(&actual).unwrap());
 
-    for field in vec![
+    for field in &[
         "coveragePercent",
         "linesCovered",
         "linesMissed",
@@ -400,7 +384,7 @@ fn get_version(compiler: &str) -> String {
     get_compiler_major(&version)
 }
 
-fn get_compiler_major(version: &String) -> String {
+fn get_compiler_major(version: &str) -> String {
     let re = Regex::new(r"(?:version |(?:gcc \([^\)]+\) )*)([0-9]+)\.[0-9]+\.[0-9]+").unwrap();
     match re.captures(version) {
         Some(caps) => caps.get(1).unwrap().as_str().to_string(),
@@ -415,23 +399,24 @@ fn create_zip(zip_path: &Path, base_dir: &Path, base_dir_in_zip: Option<&str>, f
     let mut files: Vec<PathBuf> = Vec::new();
     for entry in WalkDir::new(base_dir) {
         let entry = entry.expect("Failed to open directory.");
-        if globset.is_match(&entry.file_name()) {
+        if globset.is_match(entry.file_name()) {
             files.push(entry.path().to_path_buf());
         }
     }
 
-    let zipfile =
-        File::create(base_dir.join(zip_path)).expect(&format!("Cannot create file {:?}", zip_path));
+    let zipfile = File::create(base_dir.join(zip_path))
+        .unwrap_or_else(|_| panic!("Cannot create file {:?}", zip_path));
     let mut zip = ZipWriter::new(zipfile);
     for ref file_path in files {
-        let mut file = File::open(file_path).expect(&format!("Cannot open file {:?}", file_path));
+        let mut file =
+            File::open(file_path).unwrap_or_else(|_| panic!("Cannot open file {:?}", file_path));
         let file_size = file
             .metadata()
-            .expect(&format!("Cannot get metadata for {:?}", file_path))
+            .unwrap_or_else(|_| panic!("Cannot get metadata for {:?}", file_path))
             .len() as usize;
         let mut content: Vec<u8> = Vec::with_capacity(file_size + 1);
         file.read_to_end(&mut content)
-            .expect(&format!("Cannot read {:?}", file_path));
+            .unwrap_or_else(|_| panic!("Cannot read {:?}", file_path));
 
         let filename_in_zip = file_path.file_name().unwrap().to_str().unwrap();
         let filename_in_zip = match base_dir_in_zip {
@@ -439,30 +424,27 @@ fn create_zip(zip_path: &Path, base_dir: &Path, base_dir_in_zip: Option<&str>, f
             None => filename_in_zip.to_string(),
         };
 
-        zip.start_file(filename_in_zip, FileOptions::default())
-            .expect(&format!("Cannot create zip for {:?}", zip_path));
+        zip.start_file(filename_in_zip, SimpleFileOptions::default())
+            .unwrap_or_else(|_| panic!("Cannot create zip for {:?}", zip_path));
         zip.write_all(content.as_slice())
-            .expect(&format!("Cannot write {:?}", zip_path));
+            .unwrap_or_else(|_| panic!("Cannot write {:?}", zip_path));
     }
 
-    match base_dir_in_zip {
-        Some(path) => {
-            let path = PathBuf::from(path);
-            let mut path = Some(path.as_path());
-            while let Some(parent) = path {
-                let ancestor = parent.to_str().unwrap();
-                if !ancestor.is_empty() {
-                    zip.add_directory(ancestor, FileOptions::default())
-                        .expect(&format!("Cannot add a directory"));
-                }
-                path = parent.parent();
+    if let Some(path) = base_dir_in_zip {
+        let path = PathBuf::from(path);
+        let mut path = Some(path.as_path());
+        while let Some(parent) = path {
+            let ancestor = parent.to_str().unwrap();
+            if !ancestor.is_empty() {
+                zip.add_directory(ancestor, SimpleFileOptions::default())
+                    .unwrap_or_else(|_| panic!("Cannot add a directory"));
             }
+            path = parent.parent();
         }
-        None => {}
     }
 
     zip.finish()
-        .expect(&format!("Unable to write zip structure for {:?}", zip_path));
+        .unwrap_or_else(|_| panic!("Unable to write zip structure for {:?}", zip_path));
 }
 
 #[test]
@@ -471,7 +453,10 @@ fn test_integration() {
         let entry = entry.unwrap();
         let path = entry.path();
 
-        if path.starts_with("tests/basic_zip_zip") || path.starts_with("tests/basic_zip_dir") {
+        if path.starts_with("tests/basic_zip_zip")
+            || path.starts_with("tests/basic_zip_dir")
+            || path.starts_with("tests/rust")
+        {
             continue;
         }
 
@@ -551,12 +536,7 @@ fn test_integration_zip_zip() {
         let path = &PathBuf::from("tests/basic_zip_zip");
 
         println!("\n{}", name.to_uppercase());
-        let compiler_version = if is_llvm {
-            let clang_version = get_version(&compiler);
-            clang_version
-        } else {
-            get_version(&compiler)
-        };
+        let compiler_version = get_version(&compiler);
 
         do_clean(path);
         make(path, &compiler);
@@ -579,44 +559,38 @@ fn test_integration_zip_zip() {
         // no gcda
         println!("No gcda");
         check_equal_coveralls(
-            &read_expected(
-                path,
-                &name,
-                &compiler_version,
-                "coveralls",
-                Some("_no_gcda"),
-            ),
+            &read_expected(path, name, &compiler_version, "coveralls", Some("_no_gcda")),
             &run_grcov(vec![&gcno_zip_path, &gcda0_zip_path], path, "coveralls"),
             false,
         );
 
         check_equal_covdir(
-            &read_expected(path, &name, &compiler_version, "covdir", Some("_no_gcda")),
+            &read_expected(path, name, &compiler_version, "covdir", Some("_no_gcda")),
             &run_grcov(vec![&gcno_zip_path, &gcda0_zip_path], path, "covdir"),
         );
 
         // one gcda
         println!("One gcda");
         check_equal_coveralls(
-            &read_expected(path, &name, &compiler_version, "coveralls", None),
+            &read_expected(path, name, &compiler_version, "coveralls", None),
             &run_grcov(vec![&gcno_zip_path, &gcda_zip_path], path, "coveralls"),
             false,
         );
 
         check_equal_covdir(
-            &read_expected(path, &name, &compiler_version, "covdir", None),
+            &read_expected(path, name, &compiler_version, "covdir", None),
             &run_grcov(vec![&gcno_zip_path, &gcda_zip_path], path, "covdir"),
         );
 
         // two gcdas
         std::fs::copy(&gcda_zip_path, &gcda1_zip_path)
-            .expect(&format!("Failed to copy {:?}", &gcda_zip_path));
+            .unwrap_or_else(|_| panic!("Failed to copy {:?}", &gcda_zip_path));
 
         println!("Two gcdas");
         check_equal_coveralls(
             &read_expected(
                 path,
-                &name,
+                name,
                 &compiler_version,
                 "coveralls",
                 Some("_two_gcda"),
@@ -630,7 +604,7 @@ fn test_integration_zip_zip() {
         );
 
         check_equal_covdir(
-            &read_expected(path, &name, &compiler_version, "covdir", Some("_two_gcda")),
+            &read_expected(path, name, &compiler_version, "covdir", Some("_two_gcda")),
             &run_grcov(
                 vec![&gcno_zip_path, &gcda_zip_path, &gcda1_zip_path],
                 path,
@@ -658,12 +632,7 @@ fn test_integration_zip_dir() {
         let path = &base_path.join("foo_dir").join("bar_dir");
 
         println!("\n{}", name.to_uppercase());
-        let compiler_version = if is_llvm {
-            let clang_version = get_version(&compiler);
-            clang_version
-        } else {
-            get_version(&compiler)
-        };
+        let compiler_version = get_version(&compiler);
 
         do_clean(path);
         make(path, &compiler);
@@ -679,14 +648,14 @@ fn test_integration_zip_dir() {
         let gcno_zip_path = path.join(gcno_zip_path);
 
         check_equal_coveralls(
-            &read_expected(base_path, &name, &compiler_version, "coveralls", None),
-            &run_grcov(vec![&gcno_zip_path, &base_path], path, "coveralls"),
+            &read_expected(base_path, name, &compiler_version, "coveralls", None),
+            &run_grcov(vec![&gcno_zip_path, base_path], path, "coveralls"),
             false,
         );
 
         check_equal_covdir(
-            &read_expected(base_path, &name, &compiler_version, "covdir", None),
-            &run_grcov(vec![&gcno_zip_path, &base_path], path, "covdir"),
+            &read_expected(base_path, name, &compiler_version, "covdir", None),
+            &run_grcov(vec![&gcno_zip_path, base_path], path, "covdir"),
         );
 
         do_clean(path);

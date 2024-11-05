@@ -1,13 +1,13 @@
-use crossbeam::channel::unbounded;
+use crossbeam_channel::unbounded;
 use md5::{Digest, Md5};
 use rustc_hash::FxHashMap;
 use serde_json::{self, json, Value};
 use std::cell::RefCell;
-use std::collections::{hash_map, BTreeSet};
+use std::collections::{hash_map, BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::{
@@ -16,6 +16,8 @@ use std::{
 };
 use symbolic_common::Name;
 use symbolic_demangle::{Demangle, DemangleOptions};
+use tabled::settings::Style;
+use tabled::{Table, Tabled};
 use uuid::Uuid;
 
 use crate::defs::*;
@@ -35,28 +37,30 @@ macro_rules! demangle {
     }};
 }
 
-pub fn get_target_output_writable(output_file: Option<&str>) -> Box<dyn Write> {
+pub fn get_target_output_writable(output_file: Option<&Path>) -> Box<dyn Write> {
     let write_target: Box<dyn Write> = match output_file {
-        Some(filename) => {
-            let output = PathBuf::from(filename);
+        Some(output) => {
             if output.is_dir() {
                 panic!(
                     "The output file {} is a directory, but must be a regular file.",
-                    filename
+                    output.display()
                 )
             }
-            Box::new(File::create(&output).unwrap_or_else(|_| {
+            Box::new(File::create(output).unwrap_or_else(|_| {
                 let parent = output.parent();
                 if let Some(parent_path) = parent {
                     if !parent_path.exists() {
                         panic!(
-                            "Cannot create {} to dump coverage data, as {} doesn't exist",
-                            filename,
+                            "Cannot create file {} to dump coverage data, as the parent directory {} doesn't exist.",
+                            output.display(),
                             parent_path.display()
                         )
                     }
                 }
-                panic!("Cannot create the file {} to dump coverage data.", filename)
+                panic!(
+                    "Cannot create the file {} to dump coverage data.",
+                    output.display()
+                )
             }))
         }
         None => {
@@ -67,7 +71,7 @@ pub fn get_target_output_writable(output_file: Option<&str>) -> Box<dyn Write> {
     write_target
 }
 
-pub fn output_activedata_etl(results: CovResultIter, output_file: Option<&str>, demangle: bool) {
+pub fn output_activedata_etl(results: &[ResultTuple], output_file: Option<&Path>, demangle: bool) {
     let demangle_options = DemangleOptions::name_only();
     let mut writer = BufWriter::new(get_target_output_writable(output_file));
 
@@ -96,7 +100,7 @@ pub fn output_activedata_etl(results: CovResultIter, output_file: Option<&str>, 
         for function in result.functions.values() {
             start_indexes.push(function.start);
         }
-        start_indexes.sort();
+        start_indexes.sort_unstable();
 
         for (name, function) in &result.functions {
             // println!("{} {} {}", name, function.executed, function.start);
@@ -177,7 +181,7 @@ pub fn output_activedata_etl(results: CovResultIter, output_file: Option<&str>, 
     }
 }
 
-pub fn output_covdir(results: CovResultIter, output_file: Option<&str>) {
+pub fn output_covdir(results: &[ResultTuple], output_file: Option<&Path>, precision: usize) {
     let mut writer = BufWriter::new(get_target_output_writable(output_file));
     let mut relative: FxHashMap<PathBuf, Rc<RefCell<CDDirStats>>> = FxHashMap::default();
     let global = Rc::new(RefCell::new(CDDirStats::new("".to_string())));
@@ -223,17 +227,18 @@ pub fn output_covdir(results: CovResultIter, output_file: Option<&str>) {
 
         prev_stats.borrow_mut().files.push(CDFileStats::new(
             path.file_name().unwrap().to_str().unwrap().to_string(),
-            result.lines,
+            result.lines.clone(),
+            precision,
         ));
     }
 
-    let mut global = global.borrow_mut();
-    global.set_stats();
+    let mut global = global.take();
+    global.set_stats(precision);
 
-    serde_json::to_writer(&mut writer, &global.to_json()).unwrap();
+    serde_json::to_writer(&mut writer, &global.into_json()).unwrap();
 }
 
-pub fn output_lcov(results: CovResultIter, output_file: Option<&str>, demangle: bool) {
+pub fn output_lcov(results: &[ResultTuple], output_file: Option<&Path>, demangle: bool) {
     let demangle_options = DemangleOptions::name_only();
     let mut writer = BufWriter::new(get_target_output_writable(output_file));
     writer.write_all(b"TN:\n").unwrap();
@@ -256,7 +261,7 @@ pub fn output_lcov(results: CovResultIter, output_file: Option<&str>, demangle: 
             writeln!(
                 writer,
                 "FNDA:{},{}",
-                if function.executed { 1 } else { 0 },
+                i32::from(function.executed),
                 demangle!(name, demangle, demangle_options)
             )
             .unwrap();
@@ -274,7 +279,7 @@ pub fn output_lcov(results: CovResultIter, output_file: Option<&str>, demangle: 
         // branch coverage information
         let mut branch_count = 0;
         let mut branch_hit = 0;
-        for (line, ref taken) in &result.branches {
+        for (line, taken) in &result.branches {
             branch_count += taken.len();
             for (n, b_t) in taken.iter().enumerate() {
                 writeln!(
@@ -336,7 +341,7 @@ where
         .and_then(|child| child.wait_with_output())
         .ok() // Discard the error type -- we won't handle it anyway
         .and_then(|output| String::from_utf8(output.stdout).ok())
-        .unwrap_or_else(|| String::new())
+        .unwrap_or_default()
 }
 
 /// Returns a JSON object describing the given commit. Coveralls uses that to display commit info.
@@ -366,7 +371,7 @@ fn get_coveralls_git_info(commit_sha: &str, vcs_branch: &str) -> Value {
     // Runs `git log` with a given format, to extract some piece of commit info. On failure,
     // returns empty string.
     let gitlog = |format| -> String {
-        get_git_output(&[
+        get_git_output([
             "log",
             "--max-count=1",
             &format!("--pretty=format:{}", format),
@@ -381,15 +386,14 @@ fn get_coveralls_git_info(commit_sha: &str, vcs_branch: &str) -> Value {
     let message = gitlog("%s");
 
     let remotes: Value = {
-        let output = get_git_output(&["remote", "--verbose"]);
+        let output = get_git_output(["remote", "--verbose"]);
 
         let mut remotes = Vec::<Value>::new();
         for line in output.lines() {
             if line.ends_with(" (fetch)") {
                 let mut fields = line.split_whitespace();
-                match (fields.next(), fields.next()) {
-                    (Some(name), Some(url)) => remotes.push(json!({"name": name, "url": url})),
-                    _ => (),
+                if let (Some(name), Some(url)) = (fields.next(), fields.next()) {
+                    remotes.push(json!({"name": name, "url": url}))
                 };
             }
         }
@@ -411,15 +415,16 @@ fn get_coveralls_git_info(commit_sha: &str, vcs_branch: &str) -> Value {
 }
 
 pub fn output_coveralls(
-    results: CovResultIter,
+    results: &[ResultTuple],
     repo_token: Option<&str>,
     service_name: Option<&str>,
     service_number: &str,
     service_job_id: Option<&str>,
     service_pull_request: &str,
+    service_flag_name: Option<&str>,
     commit_sha: &str,
     with_function_info: bool,
-    output_file: Option<&str>,
+    output_file: Option<&Path>,
     vcs_branch: &str,
     parallel: bool,
     demangle: bool,
@@ -441,19 +446,19 @@ pub fn output_coveralls(
         }
 
         let mut branches = Vec::new();
-        for (line, ref taken) in &result.branches {
+        for (line, taken) in &result.branches {
             for (n, b_t) in taken.iter().enumerate() {
                 branches.push(*line);
                 branches.push(0);
                 branches.push(n as u32);
-                branches.push(if *b_t { 1 } else { 0 });
+                branches.push(u32::from(*b_t));
             }
         }
 
         if !with_function_info {
             source_files.push(json!({
                 "name": rel_path,
-                "source_digest": get_digest(abs_path),
+                "source_digest": get_digest(abs_path.clone()),
                 "coverage": coverage,
                 "branches": branches,
             }));
@@ -469,7 +474,7 @@ pub fn output_coveralls(
 
             source_files.push(json!({
                 "name": rel_path,
-                "source_digest": get_digest(abs_path),
+                "source_digest": get_digest(abs_path.clone()),
                 "coverage": coverage,
                 "branches": branches,
                 "functions": functions,
@@ -495,6 +500,10 @@ pub fn output_coveralls(
         obj.insert("service_name".to_string(), json!(service_name));
     }
 
+    if let (Some(service_flag_name), Some(obj)) = (service_flag_name, result.as_object_mut()) {
+        obj.insert("flag_name".to_string(), json!(service_flag_name));
+    }
+
     if let (Some(service_job_id), Some(obj)) = (service_job_id, result.as_object_mut()) {
         obj.insert("service_job_id".to_string(), json!(service_job_id));
     }
@@ -503,7 +512,7 @@ pub fn output_coveralls(
     serde_json::to_writer(&mut writer, &result).unwrap();
 }
 
-pub fn output_files(results: CovResultIter, output_file: Option<&str>) {
+pub fn output_files(results: &[ResultTuple], output_file: Option<&Path>) {
     let mut writer = BufWriter::new(get_target_output_writable(output_file));
     for (_, rel_path, _) in results {
         writeln!(writer, "{}", rel_path.display()).unwrap();
@@ -511,10 +520,12 @@ pub fn output_files(results: CovResultIter, output_file: Option<&str>) {
 }
 
 pub fn output_html(
-    results: CovResultIter,
-    output_dir: Option<&str>,
+    results: &[ResultTuple],
+    output_dir: Option<&Path>,
     num_threads: usize,
     branch_enabled: bool,
+    output_config_file: Option<&Path>,
+    precision: usize,
 ) {
     let output = if let Some(output_dir) = output_dir {
         PathBuf::from(output_dir)
@@ -527,7 +538,7 @@ pub fn output_html(
             eprintln!("{} is not a directory", output.to_str().unwrap());
             return;
         }
-    } else if std::fs::create_dir(&output).is_err() {
+    } else if std::fs::create_dir_all(&output).is_err() {
         eprintln!("Cannot create directory {}", output.to_str().unwrap());
         return;
     }
@@ -536,7 +547,7 @@ pub fn output_html(
 
     let stats = Arc::new(Mutex::new(HtmlGlobalStats::default()));
     let mut threads = Vec::with_capacity(num_threads);
-    let (tera, config) = html::get_config();
+    let (tera, config) = html::get_config(output_config_file);
     for i in 0..num_threads {
         let receiver = receiver.clone();
         let output = output.clone();
@@ -546,7 +557,15 @@ pub fn output_html(
         let t = thread::Builder::new()
             .name(format!("Consumer HTML {}", i))
             .spawn(move || {
-                html::consumer_html(&tera, receiver, stats, output, config, branch_enabled);
+                html::consumer_html(
+                    &tera,
+                    receiver,
+                    stats,
+                    &output,
+                    config,
+                    branch_enabled,
+                    precision,
+                );
             })
             .unwrap();
 
@@ -556,9 +575,9 @@ pub fn output_html(
     for (abs_path, rel_path, result) in results {
         sender
             .send(Some(HtmlItem {
-                abs_path,
-                rel_path,
-                result,
+                abs_path: abs_path.to_path_buf(),
+                rel_path: rel_path.to_path_buf(),
+                result: result.clone(),
             }))
             .unwrap();
     }
@@ -575,25 +594,92 @@ pub fn output_html(
 
     let global = Arc::try_unwrap(stats).unwrap().into_inner().unwrap();
 
-    html::gen_index(&tera, &global, &config, &output, branch_enabled);
+    html::gen_index(&tera, &global, &config, &output, branch_enabled, precision);
 
     for style in html::BadgeStyle::iter() {
         html::gen_badge(&tera, &global.stats, &config, &output, style);
     }
 
-    html::gen_coverage_json(&global.stats, &config, &output);
+    html::gen_coverage_json(&global.stats, &config, &output, precision);
+}
+
+pub fn output_markdown(results: &[ResultTuple], output_file: Option<&Path>, precision: usize) {
+    #[derive(Tabled)]
+    struct LineSummary {
+        file: String,
+        coverage: String,
+        covered: String,
+        missed_lines: String,
+    }
+
+    fn format_pair(start: u32, end: u32) -> String {
+        if start == end {
+            start.to_string()
+        } else {
+            format!("{}-{}", start, end)
+        }
+    }
+
+    fn format_lines(lines: &BTreeMap<u32, u64>) -> (usize, String) {
+        let mut total_missed = 0;
+        let mut missed = Vec::new();
+        let mut start: u32 = 0;
+        let mut end: u32 = 0;
+        for (&line, &hits) in lines {
+            if hits == 0 {
+                total_missed += 1;
+                if start == 0 {
+                    start = line;
+                }
+                end = line;
+            } else if start != 0 {
+                missed.push(format_pair(start, end));
+                start = 0;
+            }
+        }
+        if start != 0 {
+            missed.push(format_pair(start, end));
+        }
+        (total_missed, missed.join(", "))
+    }
+
+    let mut summary = Vec::new();
+    let mut total_lines: usize = 0;
+    let mut total_covered: usize = 0;
+    for (_, rel_path, result) in results {
+        let (missed, missed_lines) = format_lines(&result.lines);
+        let covered: usize = result.lines.len() - missed;
+        summary.push(LineSummary {
+            file: rel_path.display().to_string(),
+            coverage: format!(
+                "{:.precision$}%",
+                (covered as f32 * 100.0 / result.lines.len() as f32),
+            ),
+            covered: format!("{} / {}", covered, result.lines.len()),
+            missed_lines,
+        });
+        total_lines += result.lines.len();
+        total_covered += covered;
+    }
+    let mut writer = BufWriter::new(get_target_output_writable(output_file));
+    writeln!(writer, "{}", Table::new(summary).with(Style::markdown())).unwrap();
+    writeln!(writer).unwrap();
+    writeln!(
+        writer,
+        "Total coverage: {:.precision$}%",
+        (total_covered as f32 * 100.0 / total_lines as f32),
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
 mod tests {
-
-    extern crate tempfile;
     use super::*;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, path::Path};
 
-    fn read_file(path: &PathBuf) -> String {
+    fn read_file(path: &Path) -> String {
         let mut f =
-            File::open(path).expect(format!("{:?} file not found", path.file_name()).as_str());
+            File::open(path).unwrap_or_else(|_| panic!("{:?} file not found", path.file_name()));
         let mut s = String::new();
         f.read_to_string(&mut s).unwrap();
         s
@@ -603,7 +689,7 @@ mod tests {
     fn test_lcov_brf_brh() {
         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
         let file_name = "test_lcov_brf_brh.info";
-        let file_path = tmp_dir.path().join(&file_name);
+        let file_path = tmp_dir.path().join(file_name);
 
         let results = vec![(
             PathBuf::from("foo/bar/a.cpp"),
@@ -621,8 +707,7 @@ mod tests {
             },
         )];
 
-        let results = Box::new(results.into_iter());
-        output_lcov(results, Some(file_path.to_str().unwrap()), false);
+        output_lcov(&results, Some(&file_path), false);
 
         let results = read_file(&file_path);
 
@@ -634,7 +719,7 @@ mod tests {
     fn test_lcov_demangle() {
         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
         let file_name = "test_lcov_demangle";
-        let file_path = tmp_dir.path().join(&file_name);
+        let file_path = tmp_dir.path().join(file_name);
 
         let results = vec![(
             PathBuf::from("foo/bar/a.cpp"),
@@ -670,8 +755,7 @@ mod tests {
             },
         )];
 
-        let results = Box::new(results.into_iter());
-        output_lcov(results, Some(file_path.to_str().unwrap()), true);
+        output_lcov(&results, Some(&file_path), true);
 
         let results = read_file(&file_path);
 
@@ -684,7 +768,7 @@ mod tests {
     fn test_covdir() {
         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
         let file_name = "test_covdir.json";
-        let file_path = tmp_dir.path().join(&file_name);
+        let file_path = tmp_dir.path().join(file_name);
 
         let results = vec![
             (
@@ -725,11 +809,10 @@ mod tests {
             ),
         ];
 
-        let results = Box::new(results.into_iter());
-        output_covdir(results, Some(file_path.to_str().unwrap()));
+        output_covdir(&results, Some(&file_path), 2);
 
         let results: Value = serde_json::from_str(&read_file(&file_path)).unwrap();
-        let expected_path = PathBuf::from("./test/").join(&file_name);
+        let expected_path = PathBuf::from("./test/").join(file_name);
         let expected: Value = serde_json::from_str(&read_file(&expected_path)).unwrap();
 
         assert_eq!(results, expected);
@@ -739,7 +822,7 @@ mod tests {
     fn test_coveralls_service_job_id() {
         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
         let file_name = "test_coveralls_service_job_id.json";
-        let file_path = tmp_dir.path().join(&file_name);
+        let file_path = tmp_dir.path().join(file_name);
 
         let results = vec![(
             PathBuf::from("foo/bar/a.cpp"),
@@ -751,20 +834,20 @@ mod tests {
             },
         )];
 
-        let results = Box::new(results.into_iter());
         let expected_service_job_id: &str = "100500";
         let with_function_info: bool = true;
         let parallel: bool = true;
         output_coveralls(
-            results,
+            &results,
             None,
             None,
             "unused",
             Some(expected_service_job_id),
             "unused",
+            Some("unused"),
             "unused",
             with_function_info,
-            Some(file_path.to_str().unwrap()),
+            Some(&file_path),
             "unused",
             parallel,
             false,
@@ -776,10 +859,10 @@ mod tests {
     }
 
     #[test]
-    fn test_coveralls_token_field_is_absent_if_arg_is_none() {
+    fn test_coveralls_service_flag_name() {
         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
-        let file_name = "test_coveralls_token.json";
-        let file_path = tmp_dir.path().join(&file_name);
+        let file_name = "test_coveralls_service_job_id.json";
+        let file_path = tmp_dir.path().join(file_name);
 
         let results = vec![(
             PathBuf::from("foo/bar/a.cpp"),
@@ -791,20 +874,61 @@ mod tests {
             },
         )];
 
-        let results = Box::new(results.into_iter());
+        let expected_service_job_id: &str = "100500";
+        let expected_flag_name: &str = "expected flag name";
+        let with_function_info: bool = true;
+        let parallel: bool = true;
+        output_coveralls(
+            &results,
+            None,
+            None,
+            "unused",
+            Some(expected_service_job_id),
+            "unused",
+            Some(expected_flag_name),
+            "unused",
+            with_function_info,
+            Some(&file_path),
+            "unused",
+            parallel,
+            false,
+        );
+
+        let results: Value = serde_json::from_str(&read_file(&file_path)).unwrap();
+
+        assert_eq!(results["flag_name"], expected_flag_name);
+    }
+
+    #[test]
+    fn test_coveralls_token_field_is_absent_if_arg_is_none() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let file_name = "test_coveralls_token.json";
+        let file_path = tmp_dir.path().join(file_name);
+
+        let results = vec![(
+            PathBuf::from("foo/bar/a.cpp"),
+            PathBuf::from("foo/bar/a.cpp"),
+            CovResult {
+                lines: [(1, 10), (2, 11)].iter().cloned().collect(),
+                branches: BTreeMap::new(),
+                functions: FxHashMap::default(),
+            },
+        )];
+
         let token = None;
         let with_function_info: bool = true;
         let parallel: bool = true;
         output_coveralls(
-            results,
+            &results,
             token,
             None,
             "unused",
             None,
             "unused",
+            Some("unused"),
             "unused",
             with_function_info,
-            Some(file_path.to_str().unwrap()),
+            Some(&file_path),
             "unused",
             parallel,
             false,
@@ -819,7 +943,7 @@ mod tests {
     fn test_coveralls_service_fields_are_absent_if_args_are_none() {
         let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
         let file_name = "test_coveralls_service_fields.json";
-        let file_path = tmp_dir.path().join(&file_name);
+        let file_path = tmp_dir.path().join(file_name);
 
         let results = vec![(
             PathBuf::from("foo/bar/a.cpp"),
@@ -831,21 +955,21 @@ mod tests {
             },
         )];
 
-        let results = Box::new(results.into_iter());
         let service_name = None;
         let service_job_id = None;
         let with_function_info: bool = true;
         let parallel: bool = true;
         output_coveralls(
-            results,
+            &results,
             None,
             service_name,
             "unused",
             service_job_id,
             "unused",
+            None,
             "unused",
             with_function_info,
-            Some(file_path.to_str().unwrap()),
+            Some(&file_path),
             "unused",
             parallel,
             false,
@@ -855,5 +979,49 @@ mod tests {
 
         assert_eq!(results.get("service_name"), None);
         assert_eq!(results.get("service_job_id"), None);
+        assert_eq!(results.get("flag_name"), None)
+    }
+
+    #[test]
+    fn test_markdown() {
+        let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let file_name = "test_markdown";
+        let file_path = tmp_dir.path().join(file_name);
+
+        let results = vec![
+            (
+                PathBuf::from("foo/bar/a.cpp"),
+                PathBuf::from("foo/bar/a.cpp"),
+                CovResult {
+                    lines: [(1, 10), (2, 11)].iter().cloned().collect(),
+                    branches: BTreeMap::new(),
+                    functions: FxHashMap::default(),
+                },
+            ),
+            (
+                PathBuf::from("foo/bar/b.cpp"),
+                PathBuf::from("foo/bar/b.cpp"),
+                CovResult {
+                    lines: [(1, 0), (2, 10), (4, 10), (5, 0), (7, 0)]
+                        .iter()
+                        .cloned()
+                        .collect(),
+                    branches: BTreeMap::new(),
+                    functions: FxHashMap::default(),
+                },
+            ),
+        ];
+
+        output_markdown(&results, Some(&file_path), 2);
+
+        let results = &read_file(&file_path);
+        let expected = "| file          | coverage | covered | missed_lines |
+|---------------|----------|---------|--------------|
+| foo/bar/a.cpp | 100.00%  | 2 / 2   |              |
+| foo/bar/b.cpp | 40.00%   | 2 / 5   | 1, 5-7       |
+
+Total coverage: 57.14%
+";
+        assert_eq!(results, expected);
     }
 }

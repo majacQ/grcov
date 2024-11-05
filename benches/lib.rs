@@ -1,10 +1,8 @@
 #![feature(test)]
-extern crate crossbeam;
-extern crate grcov;
-extern crate rustc_hash;
+#![allow(clippy::unit_arg)]
 extern crate test;
 
-use crossbeam::channel::unbounded;
+use crossbeam_channel::unbounded;
 use grcov::{CovResult, Function, FunctionMap};
 use rustc_hash::FxHashMap;
 use std::path::PathBuf;
@@ -85,7 +83,6 @@ fn bench_lib_consumer(b: &mut Bencher) {
         FxHashMap::with_capacity_and_hasher(20_000, Default::default()),
     ));
     let (sender, receiver) = unbounded();
-    let source_root = None;
     let working_dir = PathBuf::from("");
     let gcno_buf: Vec<u8> = vec![
         111, 110, 99, 103, 42, 50, 48, 52, 74, 200, 254, 66, 0, 0, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0,
@@ -104,19 +101,18 @@ fn bench_lib_consumer(b: &mut Bencher) {
             let receiver = receiver.clone();
             let result_map = Arc::clone(&result_map);
             let working_dir = working_dir.clone();
-            let source_root = source_root.clone();
 
             let t = thread::Builder::new()
                 .name(format!("Consumer {}", i))
                 .spawn(move || {
                     consumer(
                         &working_dir,
-                        &source_root,
+                        None,
                         &result_map,
                         receiver,
                         false,
                         false,
-                        &None,
+                        None,
                     );
                 })
                 .unwrap();
@@ -127,7 +123,7 @@ fn bench_lib_consumer(b: &mut Bencher) {
         for _ in 0..10_000 {
             sender
                 .send(Some(WorkItem {
-                    format: ItemFormat::GCNO,
+                    format: ItemFormat::Gcno,
                     item: ItemType::Buffers(GcnoBuffers {
                         stem: "".to_string(),
                         gcno_buf: gcno_buf.clone(),

@@ -1,5 +1,6 @@
 use flate2::read::GzDecoder;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use std::cmp::Ordering;
 use std::collections::{btree_map, hash_map, BTreeMap};
 use std::fmt;
 use std::fs::File;
@@ -7,11 +8,14 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::num::ParseIntError;
 use std::path::Path;
 use std::str;
+use std::sync::Arc;
 
 use log::error;
 
-use xml::events::{BytesStart, Event};
-use xml::Reader;
+use quick_xml::encoding::Decoder;
+use quick_xml::events::attributes::AttrError;
+use quick_xml::events::{BytesStart, Event};
+use quick_xml::Reader;
 
 use rustc_hash::FxHashMap;
 
@@ -31,12 +35,18 @@ impl From<io::Error> for ParserError {
     }
 }
 
-impl From<xml::Error> for ParserError {
-    fn from(err: xml::Error) -> ParserError {
+impl From<quick_xml::Error> for ParserError {
+    fn from(err: quick_xml::Error) -> ParserError {
         match err {
-            xml::Error::Io(e) => ParserError::Io(e),
+            quick_xml::Error::Io(e) => ParserError::Io(Arc::try_unwrap(e).unwrap()),
             _ => ParserError::Parse(format!("{:?}", err)),
         }
+    }
+}
+
+impl From<AttrError> for ParserError {
+    fn from(err: AttrError) -> ParserError {
+        ParserError::Parse(format!("{:?}", err))
     }
 }
 
@@ -47,7 +57,7 @@ impl From<ParseIntError> for ParserError {
 }
 
 impl fmt::Display for ParserError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             ParserError::Io(ref err) => write!(f, "IO error: {}", err),
             ParserError::Parse(ref s) => write!(f, "Record containing invalid integer: '{}'", s),
@@ -78,7 +88,7 @@ macro_rules! try_next {
 
 macro_rules! try_parse_next {
     ($v:expr, $l:expr) => {
-        try_parse!(try_next!($v, $l), $l);
+        try_parse!(try_next!($v, $l), $l)
     };
 }
 
@@ -106,13 +116,14 @@ pub fn add_branch(branches: &mut BTreeMap<u32, Vec<bool>>, line_no: u32, no: u32
             let v = c.into_mut();
             let l = v.len();
             let no = no as usize;
-            if no == l {
-                v.push(taken);
-            } else if no > l {
-                v.extend(vec![false; no - l]);
-                v.push(taken)
-            } else {
-                v[no] |= taken;
+
+            match no.cmp(&l) {
+                Ordering::Equal => v.push(taken),
+                Ordering::Greater => {
+                    v.extend(vec![false; no - l]);
+                    v.push(taken);
+                }
+                Ordering::Less => v[no] |= taken,
             }
         }
         btree_map::Entry::Vacant(v) => {
@@ -180,9 +191,19 @@ pub fn parse_lcov(
                 }
 
                 let key = iter
-                    .take_while(|&&c| c != b':')
-                    .fold(*c as u32, |r, &x| r * (1 << 8) + u32::from(x));
-                match key {
+                    .take_while(|&&c| c.is_ascii_uppercase())
+                    .try_fold(*c as u32, |r, &x| {
+                        r.checked_mul(1 << 8)?.checked_add(u32::from(x))
+                    });
+
+                if key.is_none() {
+                    return Err(ParserError::InvalidRecord(format!(
+                        "Invalid key at line {}",
+                        line
+                    )));
+                }
+
+                match key.unwrap() {
                     SF => {
                         // SF:string
                         cur_file = Some(
@@ -193,9 +214,19 @@ pub fn parse_lcov(
                     }
                     DA => {
                         // DA:uint,int
+                        if let Some(c) = iter.peek() {
+                            if !c.is_ascii_digit() {
+                                return Err(ParserError::InvalidRecord(format!(
+                                    "DA at line {}",
+                                    line
+                                )));
+                            }
+                        }
+
                         let line_no = iter
-                            .take_while(|&&c| c != b',')
+                            .take_while(|&&c| c.is_ascii_digit())
                             .fold(0, |r, &x| r * 10 + u32::from(x - b'0'));
+
                         if iter.peek().is_none() {
                             return Err(ParserError::InvalidRecord(format!("DA at line {}", line)));
                         }
@@ -204,7 +235,7 @@ pub fn parse_lcov(
                                 iter.take_while(|&&c| c != b'\n').last();
                                 0
                             } else {
-                                iter.take_while(|&&c| c != b'\n' && c != b'\r')
+                                iter.take_while(|&&c| c.is_ascii_digit())
                                     .fold(u64::from(*c - b'0'), |r, &x| {
                                         r * 10 + u64::from(x - b'0')
                                     })
@@ -216,8 +247,16 @@ pub fn parse_lcov(
                     }
                     FN => {
                         // FN:int,string
+                        if let Some(c) = iter.peek() {
+                            if !c.is_ascii_digit() {
+                                return Err(ParserError::InvalidRecord(format!(
+                                    "FN at line {}",
+                                    line
+                                )));
+                            }
+                        }
                         let start = iter
-                            .take_while(|&&c| c != b',')
+                            .take_while(|&&c| c.is_ascii_digit())
                             .fold(0, |r, &x| r * 10 + u32::from(x - b'0'));
                         if iter.peek().is_none() {
                             return Err(ParserError::InvalidRecord(format!("FN at line {}", line)));
@@ -244,8 +283,16 @@ pub fn parse_lcov(
                     }
                     FNDA => {
                         // FNDA:int,string
+                        if let Some(c) = iter.peek() {
+                            if !c.is_ascii_digit() {
+                                return Err(ParserError::InvalidRecord(format!(
+                                    "FNDA at line {}",
+                                    line
+                                )));
+                            }
+                        }
                         let executed = iter
-                            .take_while(|&&c| c != b',')
+                            .take_while(|&&c| c.is_ascii_digit())
                             .fold(0, |r, &x| r * 10 + u64::from(x - b'0'));
                         if iter.peek().is_none() {
                             return Err(ParserError::InvalidRecord(format!(
@@ -269,8 +316,16 @@ pub fn parse_lcov(
                     BRDA => {
                         // BRDA:int,int,int,int or -
                         if branch_enabled {
+                            if let Some(c) = iter.peek() {
+                                if !c.is_ascii_digit() {
+                                    return Err(ParserError::InvalidRecord(format!(
+                                        "BRDA at line {}",
+                                        line
+                                    )));
+                                }
+                            }
                             let line_no = iter
-                                .take_while(|&&c| c != b',')
+                                .take_while(|&&c| c.is_ascii_digit())
                                 .fold(0, |r, &x| r * 10 + u32::from(x - b'0'));
                             if iter.peek().is_none() {
                                 return Err(ParserError::InvalidRecord(format!(
@@ -279,7 +334,7 @@ pub fn parse_lcov(
                                 )));
                             }
                             let _block_number = iter
-                                .take_while(|&&c| c != b',')
+                                .take_while(|&&c| c.is_ascii_digit())
                                 .fold(0, |r, &x| r * 10 + u64::from(x - b'0'));
                             if iter.peek().is_none() {
                                 return Err(ParserError::InvalidRecord(format!(
@@ -288,7 +343,7 @@ pub fn parse_lcov(
                                 )));
                             }
                             let branch_number = iter
-                                .take_while(|&&c| c != b',')
+                                .take_while(|&&c| c.is_ascii_digit())
                                 .fold(0, |r, &x| r * 10 + u32::from(x - b'0'));
                             if iter.peek().is_none() {
                                 return Err(ParserError::InvalidRecord(format!(
@@ -298,7 +353,7 @@ pub fn parse_lcov(
                             }
                             let taken = iter
                                 .take_while(|&&c| c != b'\n' && c != b'\r')
-                                .fold(false, |r, &x| r || x != b'-');
+                                .any(|&x| x != b'-');
                             add_branch(&mut cur_branches, line_no, branch_number, taken);
                         } else {
                             iter.take_while(|&&c| c != b'\n').last();
@@ -316,6 +371,7 @@ pub fn parse_lcov(
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct GcovJson {
     format_version: String,
     gcc_version: String,
@@ -334,22 +390,27 @@ struct GcovFile {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct GcovLine {
     line_number: u32,
     function_name: Option<String>,
+    #[serde(deserialize_with = "deserialize_counter")]
     count: u64,
     unexecuted_block: bool,
     branches: Vec<GcovBr>,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct GcovBr {
+    #[serde(deserialize_with = "deserialize_counter")]
     count: u64,
     throw: bool,
     fallthrough: bool,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct GcovFunction {
     name: String,
     demangled_name: String,
@@ -359,11 +420,35 @@ struct GcovFunction {
     end_column: u32,
     blocks: u32,
     blocks_executed: u32,
+    #[serde(deserialize_with = "deserialize_counter")]
     execution_count: u64,
 }
 
+// JSON sometimes surprises us with floats where we expected integers, use
+// a custom deserializer to ensure all the counters are converted to u64.
+pub fn deserialize_counter<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let n: serde_json::Number = Deserialize::deserialize(deserializer)?;
+    if n.is_f64() {
+        let value: f64 = n.as_f64().unwrap();
+        if (value >= 0.0) && (value <= u64::MAX as f64) {
+            return Ok(value as u64);
+        }
+    }
+
+    match n.as_u64() {
+        Some(value) => Ok(value),
+        None => Err(serde::de::Error::custom(format!(
+            "Unable to parse u64 from {}",
+            n
+        ))),
+    }
+}
+
 pub fn parse_gcov_gz(gcov_path: &Path) -> Result<Vec<(String, CovResult)>, ParserError> {
-    let f = File::open(&gcov_path)
+    let f = File::open(gcov_path)
         .unwrap_or_else(|_| panic!("Failed to open gcov file {}", gcov_path.display()));
 
     let file = BufReader::new(&f);
@@ -423,7 +508,7 @@ pub fn parse_gcov(gcov_path: &Path) -> Result<Vec<(String, CovResult)>, ParserEr
     let mut cur_functions = FxHashMap::default();
     let mut results = Vec::new();
 
-    let f = File::open(&gcov_path)
+    let f = File::open(gcov_path)
         .unwrap_or_else(|_| panic!("Failed to open gcov file {}", gcov_path.display()));
 
     let mut file = BufReader::new(&f);
@@ -446,10 +531,10 @@ pub fn parse_gcov(gcov_path: &Path) -> Result<Vec<(String, CovResult)>, ParserEr
 
         match key {
             "file" => {
-                if cur_file.is_some() && !cur_lines.is_empty() {
+                if let Some(cur_file) = cur_file.filter(|_: &String| !cur_lines.is_empty()) {
                     // println!("{} {} {:?}", gcov_path.display(), cur_file, cur_lines);
                     results.push((
-                        cur_file.unwrap(),
+                        cur_file,
                         CovResult {
                             lines: cur_lines,
                             branches: cur_branches,
@@ -514,13 +599,13 @@ pub fn parse_gcov(gcov_path: &Path) -> Result<Vec<(String, CovResult)>, ParserEr
 
 fn get_xml_attribute<R: BufRead>(
     reader: &Reader<R>,
-    event: &BytesStart,
+    event: &BytesStart<'_>,
     name: &str,
 ) -> Result<String, ParserError> {
     for a in event.attributes() {
         let a = a?;
-        if a.key == name.as_bytes() {
-            return Ok(a.unescape_and_decode_value(reader)?);
+        if a.key.into_inner() == name.as_bytes() {
+            return Ok(a.decode_and_unescape_value(reader.decoder())?.into_owned());
         }
     }
     Err(ParserError::InvalidRecord(format!(
@@ -532,21 +617,21 @@ fn get_xml_attribute<R: BufRead>(
 fn parse_jacoco_report_sourcefile<T: BufRead>(
     parser: &mut Reader<T>,
     buf: &mut Vec<u8>,
-) -> Result<(BTreeMap<u32, u64>, BTreeMap<u32, Vec<bool>>), ParserError> {
+) -> Result<JacocoReport, ParserError> {
     let mut lines: BTreeMap<u32, u64> = BTreeMap::new();
     let mut branches: BTreeMap<u32, Vec<bool>> = BTreeMap::new();
 
     loop {
-        match parser.read_event(buf) {
-            Ok(Event::Start(ref e)) if e.local_name() == b"line" => {
+        match parser.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().into_inner() == b"line" => {
                 let (mut ci, mut cb, mut mb, mut nr) = (None, None, None, None);
                 for a in e.attributes() {
                     let a = a?;
-                    match a.key {
-                        b"ci" => ci = Some(parser.decode(&a.value)?.parse::<u64>()?),
-                        b"cb" => cb = Some(parser.decode(&a.value)?.parse::<u64>()?),
-                        b"mb" => mb = Some(parser.decode(&a.value)?.parse::<u64>()?),
-                        b"nr" => nr = Some(parser.decode(&a.value)?.parse::<u32>()?),
+                    match a.key.into_inner() {
+                        b"ci" => ci = Some(Decoder {}.decode(&a.value)?.parse::<u64>()?),
+                        b"cb" => cb = Some(Decoder {}.decode(&a.value)?.parse::<u64>()?),
+                        b"mb" => mb = Some(Decoder {}.decode(&a.value)?.parse::<u64>()?),
+                        b"nr" => nr = Some(Decoder {}.decode(&a.value)?.parse::<u32>()?),
                         _ => (),
                     }
                 }
@@ -571,11 +656,11 @@ fn parse_jacoco_report_sourcefile<T: BufRead>(
                     // This line is a statement.
                     // JaCoCo does not feature execution counts, so we set the
                     // count to 0 or 1.
-                    let hit = if ci > 0 { 1 } else { 0 };
+                    let hit = u64::from(ci > 0);
                     lines.insert(nr, hit);
                 }
             }
-            Ok(Event::End(ref e)) if e.local_name() == b"sourcefile" => {
+            Ok(Event::End(ref e)) if e.local_name().into_inner() == b"sourcefile" => {
                 break;
             }
             Err(e) => return Err(ParserError::Parse(e.to_string())),
@@ -584,7 +669,7 @@ fn parse_jacoco_report_sourcefile<T: BufRead>(
         buf.clear();
     }
 
-    Ok((lines, branches))
+    Ok(JacocoReport { lines, branches })
 }
 
 fn parse_jacoco_report_method<T: BufRead>(
@@ -595,13 +680,13 @@ fn parse_jacoco_report_method<T: BufRead>(
     let mut executed = false;
 
     loop {
-        match parser.read_event(buf) {
-            Ok(Event::Start(ref e)) if e.local_name() == b"counter" => {
+        match parser.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().into_inner() == b"counter" => {
                 if get_xml_attribute(parser, e, "type")? == "METHOD" {
                     executed = get_xml_attribute(parser, e, "covered")?.parse::<u32>()? > 0;
                 }
             }
-            Ok(Event::End(ref e)) if e.local_name() == b"method" => break,
+            Ok(Event::End(ref e)) if e.local_name().into_inner() == b"method" => break,
             Err(e) => return Err(ParserError::Parse(e.to_string())),
             _ => {}
         }
@@ -619,8 +704,8 @@ fn parse_jacoco_report_class<T: BufRead>(
     let mut functions: FunctionMap = FxHashMap::default();
 
     loop {
-        match parser.read_event(buf) {
-            Ok(Event::Start(ref e)) if e.local_name() == b"method" => {
+        match parser.read_event_into(buf) {
+            Ok(Event::Start(ref e)) if e.local_name().into_inner() == b"method" => {
                 let name = get_xml_attribute(parser, e, "name")?;
                 let full_name = format!("{}#{}", class_name, name);
 
@@ -628,7 +713,7 @@ fn parse_jacoco_report_class<T: BufRead>(
                 let function = parse_jacoco_report_method(parser, buf, start_line)?;
                 functions.insert(full_name, function);
             }
-            Ok(Event::End(ref e)) if e.local_name() == b"class" => break,
+            Ok(Event::End(ref e)) if e.local_name().into_inner() == b"class" => break,
             Err(e) => return Err(ParserError::Parse(e.to_string())),
             _ => {}
         }
@@ -646,9 +731,9 @@ fn parse_jacoco_report_package<T: BufRead>(
     let mut results_map: FxHashMap<String, CovResult> = FxHashMap::default();
 
     loop {
-        match parser.read_event(buf) {
+        match parser.read_event_into(buf) {
             Ok(Event::Start(ref e)) => {
-                match e.local_name() {
+                match e.local_name().into_inner() {
                     b"class" => {
                         // Fully qualified class name: "org/example/Person$Age"
                         let fq_class = get_xml_attribute(parser, e, "name")?;
@@ -660,7 +745,7 @@ fn parse_jacoco_report_package<T: BufRead>(
                         // Class name "Person"
                         let top_class = class
                             .split('$')
-                            .nth(0)
+                            .next()
                             .expect("Failed to parse top class name");
 
                         // Process all <method /> and <counter /> for this class
@@ -682,7 +767,8 @@ fn parse_jacoco_report_package<T: BufRead>(
                     b"sourcefile" => {
                         let sourcefile = get_xml_attribute(parser, e, "name")?;
                         let class = sourcefile.trim_end_matches(".java");
-                        let (lines, branches) = parse_jacoco_report_sourcefile(parser, buf)?;
+                        let JacocoReport { lines, branches } =
+                            parse_jacoco_report_sourcefile(parser, buf)?;
 
                         match results_map.entry(class.to_string()) {
                             hash_map::Entry::Occupied(obj) => {
@@ -702,7 +788,7 @@ fn parse_jacoco_report_package<T: BufRead>(
                     &_ => {}
                 }
             }
-            Ok(Event::End(ref e)) if e.local_name() == b"package" => break,
+            Ok(Event::End(ref e)) if e.local_name().into_inner() == b"package" => break,
             Err(e) => return Err(ParserError::Parse(e.to_string())),
             _ => {}
         }
@@ -737,14 +823,16 @@ pub fn parse_jacoco_xml_report<T: Read>(
     xml_reader: BufReader<T>,
 ) -> Result<Vec<(String, CovResult)>, ParserError> {
     let mut parser = Reader::from_reader(xml_reader);
-    parser.expand_empty_elements(true).trim_text(false);
+    let config = parser.config_mut();
+    config.expand_empty_elements = true;
+    config.trim_text(false);
 
     let mut results = Vec::new();
     let mut buf = Vec::new();
 
     loop {
-        match parser.read_event(&mut buf) {
-            Ok(Event::Start(ref e)) if e.local_name() == b"package" => {
+        match parser.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) if e.local_name().into_inner() == b"package" => {
                 let package = get_xml_attribute(&parser, e, "name")?;
                 let mut package_results =
                     parse_jacoco_report_package(&mut parser, &mut buf, &package)?;
@@ -865,11 +953,11 @@ mod tests {
         assert!(result.functions.contains_key("MainProcessSingleton"));
         let func = result.functions.get("MainProcessSingleton").unwrap();
         assert_eq!(func.start, 15);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
         assert!(result.functions.contains_key("logConsoleMessage"));
         let func = result.functions.get("logConsoleMessage").unwrap();
         assert_eq!(func.start, 21);
-        assert_eq!(func.executed, false);
+        assert!(!func.executed);
     }
 
     #[test]
@@ -964,11 +1052,11 @@ mod tests {
         assert!(result.functions.contains_key("MainProcessSingleton"));
         let func = result.functions.get("MainProcessSingleton").unwrap();
         assert_eq!(func.start, 15);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
         assert!(result.functions.contains_key("logConsoleMessage"));
         let func = result.functions.get("logConsoleMessage").unwrap();
         assert_eq!(func.start, 21);
-        assert_eq!(func.executed, false);
+        assert!(!func.executed);
     }
 
     #[test]
@@ -1051,7 +1139,7 @@ mod tests {
         assert!(result.functions.contains_key("MainProcessSingleton"));
         let func = result.functions.get("MainProcessSingleton").unwrap();
         assert_eq!(func.start, 15);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
         assert!(result
             .functions
             .contains_key("cubic-bezier(0.0, 0.0, 1.0, 1.0)"));
@@ -1060,7 +1148,7 @@ mod tests {
             .get("cubic-bezier(0.0, 0.0, 1.0, 1.0)")
             .unwrap();
         assert_eq!(func.start, 95);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
     }
 
     #[test]
@@ -1142,7 +1230,7 @@ mod tests {
         assert!(result.functions.contains_key("MainProcessSingleton"));
         let func = result.functions.get("MainProcessSingleton").unwrap();
         assert_eq!(func.start, 15);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
         assert!(result
             .functions
             .contains_key("cubic-bezier(0.0, 0.0, 1.0, 1.0)"));
@@ -1151,7 +1239,7 @@ mod tests {
             .get("cubic-bezier(0.0, 0.0, 1.0, 1.0)")
             .unwrap();
         assert_eq!(func.start, 95);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
     }
 
     #[allow(non_snake_case)]
@@ -1162,6 +1250,22 @@ mod tests {
         f.read_to_end(&mut buf).unwrap();
         let result = parse_lcov(buf, true);
         assert!(result.is_err());
+    }
+
+    #[allow(non_snake_case)]
+    #[test]
+    fn test_lcov_parser_empty_DA_record() {
+        let buf = "DA:152,4
+DA:153,4
+DA:154,8
+DA:156,12
+DA
+TN:http_3a_2f_2fweb_2dplatform_2etest_3a8000_2freferrer_2dpolicy_2fgen_2fsrcdoc_2dinherit_2emeta_2funset_2fiframe_2dtag_2ehttp_2ehtml_2c_20about_3ablank"
+        .as_bytes().to_vec();
+        let result = parse_lcov(buf, true);
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(error.to_string(), "Invalid record: 'DA at line 5'");
     }
 
     #[test]
@@ -1190,7 +1294,7 @@ mod tests {
         assert!(result.functions.contains_key("_ZN19nsExpirationTrackerIN11nsIDocument16SelectorCacheKeyELj4EE25ExpirationTrackerObserver7ReleaseEv"));
         let mut func = result.functions.get("_ZN19nsExpirationTrackerIN11nsIDocument16SelectorCacheKeyELj4EE25ExpirationTrackerObserver7ReleaseEv").unwrap();
         assert_eq!(func.start, 393);
-        assert_eq!(func.executed, false);
+        assert!(!func.executed);
 
         let (ref source_name, ref result) = results[5];
         assert_eq!(
@@ -1345,7 +1449,7 @@ mod tests {
             .get("_ZL13LoadGtkModuleR24GnomeAccessibilityModule")
             .unwrap();
         assert_eq!(func.start, 81);
-        assert_eq!(func.executed, false);
+        assert!(!func.executed);
         assert!(result
             .functions
             .contains_key("_ZN7mozilla4a11y12PlatformInitEv"));
@@ -1354,7 +1458,7 @@ mod tests {
             .get("_ZN7mozilla4a11y12PlatformInitEv")
             .unwrap();
         assert_eq!(func.start, 136);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
         assert!(result
             .functions
             .contains_key("_ZN7mozilla4a11y16PlatformShutdownEv"));
@@ -1363,11 +1467,11 @@ mod tests {
             .get("_ZN7mozilla4a11y16PlatformShutdownEv")
             .unwrap();
         assert_eq!(func.start, 216);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
         assert!(result.functions.contains_key("_ZN7mozilla4a11y7PreInitEv"));
         func = result.functions.get("_ZN7mozilla4a11y7PreInitEv").unwrap();
         assert_eq!(func.start, 261);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
         assert!(result
             .functions
             .contains_key("_ZN7mozilla4a11y19ShouldA11yBeEnabledEv"));
@@ -1376,7 +1480,7 @@ mod tests {
             .get("_ZN7mozilla4a11y19ShouldA11yBeEnabledEv")
             .unwrap();
         assert_eq!(func.start, 303);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
     }
 
     #[test]
@@ -1665,7 +1769,7 @@ mod tests {
         assert!(result.functions.contains_key("_ZN19nsExpirationTrackerIN11nsIDocument16SelectorCacheKeyELj4EE25ExpirationTrackerObserver7ReleaseEv"));
         let func = result.functions.get("_ZN19nsExpirationTrackerIN11nsIDocument16SelectorCacheKeyELj4EE25ExpirationTrackerObserver7ReleaseEv").unwrap();
         assert_eq!(func.start, 393);
-        assert_eq!(func.executed, false);
+        assert!(!func.executed);
     }
 
     #[test]
@@ -1697,7 +1801,7 @@ mod tests {
             .get("_ZN27rust_code_coverage_sample_24mainE")
             .unwrap();
         assert_eq!(func.start, 8);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
 
         assert!(result.functions.contains_key(
             "_ZN27rust_code_coverage_sample_244compare_types<[i32; 3],alloc::vec::Vec<i32>>E"
@@ -1707,7 +1811,188 @@ mod tests {
             .get("_ZN27rust_code_coverage_sample_244compare_types<[i32; 3],alloc::vec::Vec<i32>>E")
             .unwrap();
         assert_eq!(func.start, 3);
-        assert_eq!(func.executed, true);
+        assert!(func.executed);
+    }
+
+    #[test]
+    fn test_parser_gcov_gz() {
+        let results = parse_gcov_gz(Path::new(
+            "./test/mozillavpn_serverconnection.gcno.gcov.json.gz",
+        ))
+        .unwrap();
+        assert_eq!(results.len(), 37);
+        let (ref source_name, ref result) = results[0];
+
+        assert_eq!(source_name, "server/serverconnection.cpp");
+
+        assert_eq!(
+            result.lines,
+            [
+                (32, 0),
+                (33, 0),
+                (35, 0),
+                (36, 0),
+                (37, 0),
+                (38, 0),
+                (40, 0),
+                (41, 0),
+                (42, 0),
+                (43, 0),
+                (44, 0),
+                (45, 0),
+                (46, 0),
+                (48, 0),
+                (49, 0),
+                (50, 0),
+                (51, 0),
+                (52, 0),
+                (55, 0),
+                (56, 0),
+                (57, 0),
+                (58, 0),
+                (59, 0),
+                (61, 0),
+                (62, 0),
+                (63, 0),
+                (66, 0),
+                (67, 0),
+                (68, 0),
+                (71, 0),
+                (74, 0),
+                (75, 0),
+                (78, 0),
+                (79, 0),
+                (82, 0),
+                (83, 0),
+                (85, 0),
+                (86, 0),
+                (87, 0),
+                (88, 0),
+                (90, 0),
+                (91, 0),
+                (94, 0),
+                (95, 0),
+                (96, 0),
+                (97, 0),
+                (101, 0),
+                (102, 0),
+                (103, 0),
+                (104, 0),
+                (107, 0),
+                (112, 0),
+                (113, 0),
+                (114, 0),
+                (118, 0),
+                (119, 0),
+                (120, 0),
+                (124, 0),
+                (125, 0),
+                (126, 0),
+                (129, 0),
+                (130, 0),
+                (131, 0),
+                (135, 0),
+                (136, 0),
+                (137, 0),
+                (138, 0),
+                (139, 0),
+                (142, 0),
+                (143, 0),
+                (144, 0),
+                (148, 0),
+                (149, 0),
+                (150, 0),
+                (151, 0),
+                (157, 0),
+                (158, 0),
+                (159, 0),
+                (164, 0),
+                (169, 0),
+                (171, 0),
+                (172, 0),
+                (175, 0),
+                (176, 0),
+                (178, 0),
+                (179, 0),
+                (181, 0),
+                (183, 0),
+                (184, 0),
+                (185, 0),
+                (186, 0),
+                (188, 0),
+                (189, 0),
+                (190, 0),
+                (193, 0),
+                (194, 0),
+                (195, 0),
+                (196, 0),
+                (199, 0),
+                (200, 0),
+                (202, 0),
+                (203, 0),
+                (205, 0),
+                (206, 0),
+                (207, 0),
+                (210, 0),
+                (216, 0),
+                (217, 0),
+                (220, 0),
+                (221, 0),
+                (223, 0),
+                (225, 0),
+                (226, 0),
+                (227, 0),
+                (230, 0),
+                (231, 0),
+                (234, 0),
+                (237, 0),
+                (238, 0),
+                (239, 0),
+                (241, 0),
+                (242, 0),
+                (243, 0),
+                (245, 0),
+                (247, 0),
+                (248, 0),
+                (249, 0),
+                (251, 0),
+                (252, 0),
+                (254, 0),
+                (255, 0),
+                (256, 0),
+                (257, 0),
+                (258, 0),
+                (260, 0),
+                (261, 0),
+                (262, 0),
+                (263, 0),
+                (264, 0),
+                (267, 0),
+                (268, 0),
+                (270, 0),
+                (271, 0),
+                (272, 0),
+                (273, 0),
+                (274, 0),
+                (275, 0),
+                (279, 0)
+            ]
+            .iter()
+            .cloned()
+            .collect()
+        );
+
+        assert_eq!(result.branches, [].iter().cloned().collect());
+
+        assert!(result
+            .functions
+            .contains_key("ServerConnection::readData()"));
+        let func = result
+            .functions
+            .get("ServerConnection::readData()")
+            .unwrap();
+        assert_eq!(func.start, 188);
+        assert!(!func.executed);
     }
 
     #[test]
@@ -1736,9 +2021,9 @@ mod tests {
         let expected = vec![(
             String::from("hello.java"),
             CovResult {
-                lines: lines,
-                branches: branches,
-                functions: functions,
+                lines,
+                branches,
+                functions,
             },
         )];
 
@@ -1752,8 +2037,8 @@ mod tests {
     #[test]
     fn test_parser_jacoco_xml_inner_classes() {
         let mut lines: BTreeMap<u32, u64> = BTreeMap::new();
-        for i in vec![5, 10, 14, 15, 18, 22, 23, 25, 27, 31, 34, 37, 44, 49] {
-            lines.insert(i, 0);
+        for i in &[5, 10, 14, 15, 18, 22, 23, 25, 27, 31, 34, 37, 44, 49] {
+            lines.insert(*i, 0);
         }
         let mut functions: FunctionMap = FxHashMap::default();
 
@@ -1777,15 +2062,15 @@ mod tests {
             ),
             ("Person#setAge", 22, false),
         ] {
-            functions.insert(String::from(name), Function { executed, start });
+            functions.insert(String::from(name), Function { start, executed });
         }
         let branches: BTreeMap<u32, Vec<bool>> = BTreeMap::new();
         let expected = vec![(
             String::from("org/gradle/Person.java"),
             CovResult {
-                lines: lines,
-                branches: branches,
-                functions: functions,
+                lines,
+                branches,
+                functions,
             },
         )];
 

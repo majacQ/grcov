@@ -1,356 +1,356 @@
-#[cfg(feature = "tc")]
-use tcmalloc::TCMalloc;
-
-#[cfg(feature = "tc")]
+#[cfg(all(unix, feature = "tc"))]
 #[global_allocator]
-static GLOBAL: TCMalloc = TCMalloc;
+static GLOBAL: tcmalloc::TCMalloc = tcmalloc::TCMalloc;
 
-extern crate clap;
-extern crate crossbeam;
-extern crate grcov;
-extern crate num_cpus;
-extern crate rustc_hash;
-extern crate serde_json;
-extern crate simplelog;
-extern crate tempfile;
-
-use clap::{crate_authors, crate_version, App, Arg, ArgGroup};
-use crossbeam::channel::bounded;
+use clap::{builder::PossibleValue, ArgGroup, Parser, ValueEnum};
+use crossbeam_channel::bounded;
 use log::error;
+use regex::Regex;
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode, WriteLogger};
 use std::fs::{self, File};
 use std::ops::Deref;
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::{process, thread};
 
 use grcov::*;
 
-fn main() {
-    let default_num_threads = 1.max(num_cpus::get() - 1).to_string();
+#[derive(Clone, PartialEq)]
+enum OutputType {
+    Ade,
+    Lcov,
+    Coveralls,
+    CoverallsPlus,
+    Files,
+    Covdir,
+    Html,
+    Cobertura,
+    CoberturaPretty,
+    Markdown,
+}
 
-    let matches = App::new("grcov")
-                          .version(crate_version!())
-                          .author(crate_authors!("\n"))
-                          .about("Parse, collect and aggregate code coverage data for multiple source files")
+impl FromStr for OutputType {
+    type Err = String;
 
-                          .arg(Arg::with_name("paths")
-                               .help("Sets the input paths to use")
-                               .required(true)
-                               .multiple(true)
-                               .takes_value(true))
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "ade" => Self::Ade,
+            "lcov" => Self::Lcov,
+            "coveralls" => Self::Coveralls,
+            "coveralls+" => Self::CoverallsPlus,
+            "files" => Self::Files,
+            "covdir" => Self::Covdir,
+            "html" => Self::Html,
+            "cobertura" => Self::Cobertura,
+            "cobertura-pretty" => Self::CoberturaPretty,
+            "markdown" => Self::Markdown,
+            _ => return Err(format!("{} is not a supported output type", s)),
+        })
+    }
+}
 
-                          .arg(Arg::with_name("binary_path")
-                               .help("Sets the path to the compiled binary to be used")
-                               .short("b")
-                               .long("binary-path")
-                               .value_name("PATH")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("output_type")
-                               .help("Sets a custom output type")
-                               .long_help(
-"Sets a custom output type:
-- *html* for a HTML coverage report;
-- *coveralls* for the Coveralls specific format;
-- *lcov* for the lcov INFO format;
-- *covdir* for the covdir recursive JSON format;
-- *coveralls+* for the Coveralls specific format with function information;
-- *ade* for the ActiveData-ETL specific format;
-- *files* to only return a list of files.
-")
-                               .short("t")
-                               .long("output-type")
-                               .value_name("OUTPUT TYPE")
-                               .default_value("lcov")
-                               .possible_values(&["ade", "lcov", "coveralls", "coveralls+", "files", "covdir", "html", "cobertura"])
-                               .takes_value(true)
-                               .requires_ifs(&[
-                                   ("coveralls", "coveralls_auth"),
-                                   ("coveralls+", "coveralls_auth")
-                               ]))
-
-                          .arg(Arg::with_name("output_path")
-                               .help("Specifies the output path")
-                               .short("o")
-                               .long("output-path")
-                               .alias("output-file")
-                               .value_name("PATH")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("source_dir")
-                               .help("Specifies the root directory of the source files")
-                               .short("s")
-                               .long("source-dir")
-                               .value_name("DIRECTORY")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("prefix_dir")
-                               .help("Specifies a prefix to remove from the paths (e.g. if grcov is run on a different machine than the one that generated the code coverage information)")
-                               .short("p")
-                               .long("prefix-dir")
-                               .value_name("PATH")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("ignore_not_existing")
-                               .help("Ignore source files that can't be found on the disk")
-                               .long("ignore-not-existing"))
-
-                          .arg(Arg::with_name("ignore_dir")
-                               .help("Ignore files/directories specified as globs")
-                               .long("ignore")
-                               .value_name("PATH")
-                               .multiple(true)
-                               .number_of_values(1)
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("keep_dir")
-                               .help("Keep only files/directories specified as globs")
-                               .long("keep-only")
-                               .value_name("PATH")
-                               .multiple(true)
-                               .number_of_values(1)
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("path_mapping")
-                               .long("path-mapping")
-                               .value_name("PATH")
-                               .multiple(true)
-                               .number_of_values(1)
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("branch")
-                               .help("Enables parsing branch coverage information")
-                               .long("branch"))
-
-                          .arg(Arg::with_name("filter")
-                               .help("Filters out covered/uncovered files. Use 'covered' to only return covered files, 'uncovered' to only return uncovered files")
-                               .long("filter")
-                               .possible_values(&["covered", "uncovered"])
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("llvm")
-                               .help("Speeds-up parsing, when the code coverage information is exclusively coming from a llvm build")
-                               .long("llvm"))
-
-                          .arg(Arg::with_name("token")
-                               .help("Sets the repository token from Coveralls, required for the 'coveralls' and 'coveralls+' formats")
-                               .long("token")
-                               .value_name("TOKEN")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("commit_sha")
-                               .help("Sets the hash of the commit used to generate the code coverage data")
-                               .long("commit-sha")
-                               .value_name("COMMIT HASH")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("service_name")
-                               .help("Sets the service name")
-                               .long("service-name")
-                               .value_name("SERVICE NAME")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("service_number")
-                               .help("Sets the service number")
-                               .long("service-number")
-                               .value_name("SERVICE NUMBER")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("service_job_id")
-                               .help("Sets the service job id")
-                               .long("service-job-id")
-                               .value_name("SERVICE JOB ID")
-                               .takes_value(true)
-                               .visible_alias("service-job-number")
-                               .requires("service_name"))
-
-                          .arg(Arg::with_name("service_pull_request")
-                               .help("Sets the service pull request number")
-                               .long("service-pull-request")
-                               .value_name("SERVICE PULL REQUEST")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("parallel")
-                               .help("Sets the build type to be parallel for 'coveralls' and 'coveralls+' formats")
-                               .long("parallel"))
-
-                          .arg(Arg::with_name("threads")
-                               .long("threads")
-                               .value_name("NUMBER")
-                               .default_value(&default_num_threads)
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("guess_directory")
-                               .long("guess-directory-when-missing"))
-
-                          .arg(Arg::with_name("vcs_branch")
-                               .help("Set the branch for coveralls report. Defaults to 'master'")
-                               .long("vcs-branch")
-                               .default_value("master")
-                               .value_name("VCS BRANCH")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("log")
-                               .help("Set the file where to log (or stderr or stdout). Defaults to 'stderr'")
-                               .long("log")
-                               .default_value("stderr")
-                               .value_name("LOG")
-                               .takes_value(true))
-
-                          .arg(Arg::with_name("excl-line")
-                               .help("Lines in covered files containing this marker will be excluded.")
-                               .long("excl-line")
-                               .value_name("regex")
-                               .takes_value(true))
-
-                            .arg(Arg::with_name("excl-start")
-                                .help("Marks the beginning of an excluded section. The current line is part of this section.")
-                                .long("excl-start")
-                                .value_name("regex")
-                                .takes_value(true))
-
-                            .arg(Arg::with_name("excl-stop")
-                                .help("Marks the end of an excluded section. The current line is part of this section.")
-                                .long("excl-stop")
-                                .value_name("regex")
-                                .takes_value(true))
-
-                          .arg(Arg::with_name("excl-br-line")
-                               .help("Lines in covered files containing this marker will be excluded from branch coverage.")
-                               .long("excl-br-line")
-                               .value_name("regex")
-                               .takes_value(true))
-
-                            .arg(Arg::with_name("excl-br-start")
-                                .help("Marks the beginning of a section excluded from branch coverage. The current line is part of this section.")
-                                .long("excl-br-start")
-                                .value_name("regex")
-                                .takes_value(true))
-
-                            .arg(Arg::with_name("excl-br-stop")
-                                .help("Marks the end of a section excluded from branch coverage. The current line is part of this section.")
-                                .long("excl-br-stop")
-                                .value_name("regex")
-                                .takes_value(true))
-
-                            .arg(Arg::with_name("no-demangle")
-                               .help("No symbol demangling")
-                               .long("no-demangle"))
-
-                          // This group requires that at least one of --token and --service-job-id
-                          // be present. --service-job-id requires --service-name, so this
-                          // effectively means we accept the following combinations:
-                          // - --token
-                          // - --token --service-job-id --service-name
-                          // - --service-job-id --service-name
-                          .group(ArgGroup::with_name("coveralls_auth").args(&["token", "service_job_id"]).multiple(true))
-
-                          .get_matches();
-
-    let paths: Vec<_> = matches.values_of("paths").unwrap().collect();
-    let paths: Vec<String> = paths.iter().map(|s| s.to_string()).collect();
-    let binary_path = if let Some(binary_path) = matches.value_of("binary_path") {
-        Some(PathBuf::from(binary_path))
-    } else {
-        None
-    };
-    let output_type = matches.value_of("output_type").unwrap();
-    let output_path = matches.value_of("output_path");
-    let source_dir = matches.value_of("source_dir").unwrap_or("");
-    let prefix_dir = matches.value_of("prefix_dir").unwrap_or("");
-    let ignore_not_existing = matches.is_present("ignore_not_existing");
-    let mut to_ignore_dirs: Vec<_> = if let Some(to_ignore_dirs) = matches.values_of("ignore_dir") {
-        to_ignore_dirs.collect()
-    } else {
-        Vec::new()
-    };
-    let to_keep_dirs: Vec<_> = matches
-        .values_of("keep_dir")
-        .map_or_else(|| Vec::new(), |dirs| dirs.collect());
-    let path_mapping_file = matches.value_of("path_mapping").unwrap_or("");
-    let branch_enabled = matches.is_present("branch");
-    let filter_option = if let Some(filter) = matches.value_of("filter") {
-        if filter == "covered" {
-            Some(true)
-        } else {
-            Some(false)
-        }
-    } else {
-        None
-    };
-    let is_llvm = matches.is_present("llvm");
-    let repo_token = matches.value_of("token");
-    let commit_sha = matches.value_of("commit_sha").unwrap_or("");
-    let service_name = matches.value_of("service_name");
-    let is_parallel = matches.is_present("parallel");
-    let service_number = matches.value_of("service_number").unwrap_or("");
-    let service_job_id = matches.value_of("service_job_id");
-    let service_pull_request = matches.value_of("service_pull_request").unwrap_or("");
-    let vcs_branch = matches.value_of("vcs_branch").unwrap_or("");
-    let log = matches.value_of("log").unwrap_or("");
-    match log {
-        "stdout" => {
-            let _ = TermLogger::init(
-                LevelFilter::Error,
-                Config::default(),
-                TerminalMode::Stdout,
-                ColorChoice::Auto,
-            );
-        }
-        "stderr" => {
-            let _ = TermLogger::init(
-                LevelFilter::Error,
-                Config::default(),
-                TerminalMode::Stderr,
-                ColorChoice::Auto,
-            );
-        }
-        log => {
-            if let Ok(file) = File::create(log) {
-                let _ = WriteLogger::init(LevelFilter::Error, Config::default(), file);
+impl OutputType {
+    fn to_file_name(&self, output_path: Option<&Path>) -> Option<PathBuf> {
+        output_path.map(|path| {
+            if path.is_dir() {
+                match self {
+                    OutputType::Ade => path.join("activedata"),
+                    OutputType::Lcov => path.join("lcov"),
+                    OutputType::Coveralls => path.join("coveralls"),
+                    OutputType::CoverallsPlus => path.join("coveralls+"),
+                    OutputType::Files => path.join("files"),
+                    OutputType::Covdir => path.join("covdir"),
+                    OutputType::Html => path.join("html"),
+                    OutputType::Cobertura | OutputType::CoberturaPretty => {
+                        path.join("cobertura.xml")
+                    }
+                    OutputType::Markdown => path.join("markdown.md"),
+                }
             } else {
-                let _ = TermLogger::init(
-                    LevelFilter::Error,
-                    Config::default(),
-                    TerminalMode::Stderr,
-                    ColorChoice::Auto,
-                );
-                error!("Enable to create log file: {}. Switch to stderr", log);
+                path.to_path_buf()
             }
-        }
-    };
+        })
+    }
+}
 
-    let excl_line = matches
-        .value_of("excl-line")
-        .and_then(|f| Some(regex::Regex::new(f).expect("invalid regex for excl-line.")));
-    let excl_start = matches
-        .value_of("excl-start")
-        .and_then(|f| Some(regex::Regex::new(f).expect("invalid regex for excl-start.")));
-    let excl_stop = matches
-        .value_of("excl-stop")
-        .and_then(|f| Some(regex::Regex::new(f).expect("invalid regex for excl-stop.")));
-    let excl_br_line = matches
-        .value_of("excl-br-line")
-        .and_then(|f| Some(regex::Regex::new(f).expect("invalid regex for excl-br-line.")));
-    let excl_br_start = matches
-        .value_of("excl-br-start")
-        .and_then(|f| Some(regex::Regex::new(f).expect("invalid regex for excl-br-start.")));
-    let excl_br_stop = matches
-        .value_of("excl-br-stop")
-        .and_then(|f| Some(regex::Regex::new(f).expect("invalid regex for excl-br-stop.")));
+#[derive(clap::ValueEnum, Clone)]
+enum Filter {
+    Covered,
+    Uncovered,
+}
+
+impl FromStr for Filter {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "covered" => Self::Covered,
+            "uncovered" => Self::Uncovered,
+            _ => return Err(format!("{} is not a supported filter", s)),
+        })
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct LevelFilterArg(LevelFilter);
+
+impl ValueEnum for LevelFilterArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            Self(LevelFilter::Off),
+            Self(LevelFilter::Error),
+            Self(LevelFilter::Warn),
+            Self(LevelFilter::Info),
+            Self(LevelFilter::Debug),
+            Self(LevelFilter::Trace),
+        ]
+    }
+
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        match self.0 {
+            LevelFilter::Off => Some(PossibleValue::new("OFF")),
+            LevelFilter::Error => Some(PossibleValue::new("ERROR")),
+            LevelFilter::Warn => Some(PossibleValue::new("WARN")),
+            LevelFilter::Info => Some(PossibleValue::new("INFO")),
+            LevelFilter::Debug => Some(PossibleValue::new("DEBUG")),
+            LevelFilter::Trace => Some(PossibleValue::new("TRACE")),
+        }
+    }
+}
+
+#[derive(Parser)]
+#[command(
+    author,
+    version,
+    max_term_width = 100,
+    about = "Parse, collect and aggregate code coverage data for multiple source files",
+    help_template = "\
+{before-help}{name}
+{author-with-newline}{about-with-newline}
+{usage-heading} {usage}
+
+{all-args}{after-help}
+",
+    // This group requires that at least one of --token and --service-job-id
+    // be present. --service-job-id requires --service-name, so this
+    // effectively means we accept the following combinations:
+    // - --token
+    // - --token --service-job-id --service-name
+    // - --service-job-id --service-name
+    group = ArgGroup::new("coveralls-auth")
+        .args(&["token", "service_job_id"])
+        .multiple(true),
+)]
+struct Opt {
+    /// Sets the input paths to use.
+    #[arg(required = true)]
+    paths: Vec<String>,
+    /// Sets the path to the compiled binary to be used.
+    #[arg(short, long, value_name = "PATH")]
+    binary_path: Option<PathBuf>,
+    /// Sets the path to the LLVM bin directory.
+    #[arg(long, value_name = "PATH")]
+    llvm_path: Option<PathBuf>,
+    /// Sets a custom output type.
+    #[arg(
+        short = 't',
+        long,
+        long_help = "\
+            Comma separated list of custom output types:\n\
+            - *html* for a HTML coverage report;\n\
+            - *coveralls* for the Coveralls specific format;\n\
+            - *lcov* for the lcov INFO format;\n\
+            - *covdir* for the covdir recursive JSON format;\n\
+            - *coveralls+* for the Coveralls specific format with function information;\n\
+            - *ade* for the ActiveData-ETL specific format;\n\
+            - *files* to only return a list of files.\n\
+            - *markdown* for human easy read.\n\
+            - *cobertura* for output in cobertura format.\n\
+            - *cobertura-pretty* to pretty-print in cobertura format.\n\
+        ",
+        value_name = "OUTPUT TYPE",
+        requires_ifs = [
+            ("coveralls", "coveralls-auth"),
+            ("coveralls+", "coveralls-auth"),
+        ],
+
+        value_delimiter = ',',
+        alias = "output-type",
+        default_value = "lcov",
+    )]
+    output_types: Vec<OutputType>,
+    /// Specifies the output path. This is a file for a single output type and must be a folder
+    /// for multiple output types.
+    #[arg(short, long, value_name = "PATH", alias = "output-file")]
+    output_path: Option<PathBuf>,
+    /// Specifies the output config file.
+    #[arg(long, value_name = "PATH", alias = "output-config-file")]
+    output_config_file: Option<PathBuf>,
+    /// Specifies the root directory of the source files.
+    #[arg(short, long, value_name = "DIRECTORY")]
+    source_dir: Option<PathBuf>,
+    /// Specifies a prefix to remove from the paths (e.g. if grcov is run on a different machine
+    /// than the one that generated the code coverage information).
+    #[arg(short, long, value_name = "PATH")]
+    prefix_dir: Option<PathBuf>,
+    /// Ignore source files that can't be found on the disk.
+    #[arg(long)]
+    ignore_not_existing: bool,
+    /// Ignore files/directories specified as globs.
+    #[arg(long = "ignore", value_name = "PATH", num_args = 1)]
+    ignore_dir: Vec<String>,
+    /// Keep only files/directories specified as globs.
+    #[arg(long = "keep-only", value_name = "PATH", num_args = 1)]
+    keep_dir: Vec<String>,
+    #[arg(long, value_name = "PATH")]
+    path_mapping: Option<PathBuf>,
+    /// Enables parsing branch coverage information.
+    #[arg(long)]
+    branch: bool,
+    /// Filters out covered/uncovered files. Use 'covered' to only return covered files, 'uncovered'
+    /// to only return uncovered files.
+    #[arg(long, value_enum)]
+    filter: Option<Filter>,
+    /// Comma separated list of output types to sort files lexicographically for.
+    #[arg(
+        long,
+        value_name = "OUTPUT TYPES",
+        value_delimiter = ',',
+        alias = "sort-output-types",
+        default_value = "markdown"
+    )]
+    sort_output_types: Vec<OutputType>,
+    /// Speeds-up parsing, when the code coverage information is exclusively coming from a llvm
+    /// build.
+    #[arg(long)]
+    llvm: bool,
+    /// Sets the repository token from Coveralls, required for the 'coveralls' and 'coveralls+'
+    /// formats.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+    /// Sets the hash of the commit used to generate the code coverage data.
+    #[arg(long, value_name = "COMMIT HASH")]
+    commit_sha: Option<String>,
+    /// Sets the service name.
+    #[arg(long, value_name = "SERVICE NAME")]
+    service_name: Option<String>,
+    /// Sets the service number.
+    #[arg(long, value_name = "SERVICE NUMBER")]
+    service_number: Option<String>,
+    /// Sets the service job id.
+    #[arg(
+        long,
+        value_name = "SERVICE JOB ID",
+        visible_alias = "service-job-number",
+        requires = "service_name"
+    )]
+    service_job_id: Option<String>,
+    /// Sets the service pull request number.
+    #[arg(long, value_name = "SERVICE PULL REQUEST")]
+    service_pull_request: Option<String>,
+    /// Sets the service flag name for coveralls parallel/carryover mode
+    #[arg(long, value_name = "SERVICE FLAG NAME")]
+    service_flag_name: Option<String>,
+    /// Sets the build type to be parallel for 'coveralls' and 'coveralls+' formats.
+    #[arg(long)]
+    parallel: bool,
+    #[arg(long, value_name = "NUMBER")]
+    threads: Option<usize>,
+    /// Sets coverage decimal point precision on output reports.
+    #[arg(long, value_name = "NUMBER", default_value = "2")]
+    precision: usize,
+    #[arg(long = "guess-directory-when-missing")]
+    guess_directory: bool,
+    /// Set the branch for coveralls report. Defaults to 'master'.
+    #[arg(long, value_name = "VCS BRANCH", default_value = "master")]
+    vcs_branch: String,
+    /// Set the file where to log (or stderr or stdout). Defaults to 'stderr'.
+    #[arg(long, value_name = "LOG", default_value = "stderr")]
+    log: PathBuf,
+    /// Set the log level.
+    #[arg(long, value_name = "LEVEL", default_value = "ERROR", value_enum)]
+    log_level: LevelFilterArg,
+    /// Lines in covered files containing this marker will be excluded.
+    #[arg(long, value_name = "regex")]
+    excl_line: Option<Regex>,
+    /// Marks the beginning of an excluded section. The current line is part of this section.
+    #[arg(long, value_name = "regex")]
+    excl_start: Option<Regex>,
+    /// Marks the end of an excluded section. The current line is part of this section.
+    #[arg(long, value_name = "regex")]
+    excl_stop: Option<Regex>,
+    /// Lines in covered files containing this marker will be excluded from branch coverage.
+    #[arg(long, value_name = "regex")]
+    excl_br_line: Option<Regex>,
+    /// Marks the beginning of a section excluded from branch coverage. The current line is part of
+    /// this section.
+    #[arg(long, value_name = "regex")]
+    excl_br_start: Option<Regex>,
+    /// Marks the end of a section excluded from branch coverage. The current line is part of this
+    /// section.
+    #[arg(long, value_name = "regex")]
+    excl_br_stop: Option<Regex>,
+    /// No symbol demangling.
+    #[arg(long)]
+    no_demangle: bool,
+}
+
+fn main() {
+    let opt = Opt::parse();
+
+    if let Some(path) = opt.llvm_path {
+        LLVM_PATH.set(path).unwrap();
+    }
+
+    let filter_option = opt.filter.map(|filter| match filter {
+        Filter::Covered => true,
+        Filter::Uncovered => false,
+    });
+    let stdout = Path::new("stdout");
+    let stderr = Path::new("stderr");
+
+    if opt.log == stdout {
+        let _ = TermLogger::init(
+            opt.log_level.0,
+            Config::default(),
+            TerminalMode::Stdout,
+            ColorChoice::Auto,
+        );
+    } else if opt.log == stderr {
+        let _ = TermLogger::init(
+            opt.log_level.0,
+            Config::default(),
+            TerminalMode::Stderr,
+            ColorChoice::Auto,
+        );
+    } else if let Ok(file) = File::create(&opt.log) {
+        let _ = WriteLogger::init(opt.log_level.0, Config::default(), file);
+    } else {
+        let _ = TermLogger::init(
+            opt.log_level.0,
+            Config::default(),
+            TerminalMode::Stderr,
+            ColorChoice::Auto,
+        );
+        error!(
+            "Unable to create log file: {}. Switch to stderr",
+            opt.log.display()
+        );
+    }
+
     let file_filter = FileFilter::new(
-        excl_line,
-        excl_start,
-        excl_stop,
-        excl_br_line,
-        excl_br_start,
-        excl_br_stop,
+        opt.excl_line,
+        opt.excl_start,
+        opt.excl_stop,
+        opt.excl_br_line,
+        opt.excl_br_start,
+        opt.excl_br_stop,
     );
-    let demangle = !matches.is_present("no-demangle");
+    let demangle = !opt.no_demangle;
 
     panic::set_hook(Box::new(|panic_info| {
         let (filename, line) = panic_info
@@ -365,30 +365,19 @@ fn main() {
             panic_info
                 .payload()
                 .downcast_ref::<&str>()
-                .map(|s| *s)
+                .copied()
                 .unwrap_or("<cause unknown>")
         });
         error!("A panic occurred at {}:{}: {}", filename, line, cause);
     }));
 
-    let num_threads: usize = matches
-        .value_of("threads")
-        .unwrap()
-        .parse()
-        .expect("Number of threads should be a number");
-    let guess_directory = matches.is_present("guess_directory");
+    let num_threads: usize = opt.threads.unwrap_or_else(|| 1.max(num_cpus::get() - 1));
+    let source_root = opt
+        .source_dir
+        .filter(|source_dir| source_dir != Path::new(""))
+        .map(|source_dir| canonicalize_path(source_dir).expect("Source directory does not exist."));
 
-    let source_root = if source_dir != "" {
-        Some(canonicalize_path(&source_dir).expect("Source directory does not exist."))
-    } else {
-        None
-    };
-
-    let prefix_dir = if prefix_dir == "" {
-        source_root.clone()
-    } else {
-        Some(PathBuf::from(prefix_dir))
-    };
+    let prefix_dir = opt.prefix_dir.or_else(|| source_root.clone());
 
     let tmp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
     let tmp_path = tmp_dir.path().to_owned();
@@ -403,8 +392,10 @@ fn main() {
     let producer = {
         let sender: JobSender = sender.clone();
         let tmp_path = tmp_path.clone();
-        let path_mapping_file = path_mapping_file.to_owned();
+        let path_mapping_file = opt.path_mapping;
         let path_mapping = Arc::clone(&path_mapping);
+        let paths = opt.paths;
+        let is_llvm = opt.llvm;
 
         thread::Builder::new()
             .name(String::from("Producer"))
@@ -418,13 +409,13 @@ fn main() {
                 );
 
                 let mut path_mapping = path_mapping.lock().unwrap();
-                *path_mapping = if path_mapping_file != "" {
-                    let file = File::open(path_mapping_file).unwrap();
+                *path_mapping = if let Some(path) = path_mapping_file {
+                    let file = File::open(path).unwrap();
                     Some(serde_json::from_reader(file).unwrap())
-                } else if let Some(producer_path_mapping_buf) = producer_path_mapping_buf {
-                    Some(serde_json::from_slice(&producer_path_mapping_buf).unwrap())
                 } else {
-                    None
+                    producer_path_mapping_buf.map(|producer_path_mapping_buf| {
+                        serde_json::from_slice(&producer_path_mapping_buf).unwrap()
+                    })
                 };
             })
             .unwrap()
@@ -437,7 +428,9 @@ fn main() {
         let result_map = Arc::clone(&result_map);
         let working_dir = tmp_path.join(format!("{}", i));
         let source_root = source_root.clone();
-        let binary_path = binary_path.clone();
+        let binary_path = opt.binary_path.clone();
+        let branch_enabled = opt.branch;
+        let guess_directory = opt.guess_directory;
 
         let t = thread::Builder::new()
             .name(format!("Consumer {}", i))
@@ -445,12 +438,12 @@ fn main() {
                 fs::create_dir(&working_dir).expect("Failed to create working directory");
                 consumer(
                     &working_dir,
-                    &source_root,
+                    source_root.as_deref(),
                     &result_map,
                     receiver,
                     branch_enabled,
                     guess_directory,
-                    &binary_path,
+                    binary_path.as_deref(),
                 );
             })
             .unwrap();
@@ -458,7 +451,7 @@ fn main() {
         parsers.push(t);
     }
 
-    if let Err(_) = producer.join() {
+    if producer.join().is_err() {
         process::exit(1);
     }
 
@@ -468,7 +461,7 @@ fn main() {
     }
 
     for parser in parsers {
-        if let Err(_) = parser.join() {
+        if parser.join().is_err() {
             process::exit(1);
         }
     }
@@ -482,58 +475,121 @@ fn main() {
     let iterator = rewrite_paths(
         result_map,
         path_mapping,
-        source_root,
-        prefix_dir,
-        ignore_not_existing,
-        &mut to_ignore_dirs,
-        &to_keep_dirs,
+        source_root.as_deref(),
+        prefix_dir.as_deref(),
+        opt.ignore_not_existing,
+        &opt.ignore_dir,
+        &opt.keep_dir,
         filter_option,
         file_filter,
     );
+    let mut sorted_iterator: Option<Vec<ResultTuple>> = None;
 
-    if output_type == "ade" {
-        output_activedata_etl(iterator, output_path, demangle);
-    } else if output_type == "lcov" {
-        output_lcov(iterator, output_path, demangle);
-    } else if output_type == "coveralls" {
-        output_coveralls(
-            iterator,
-            repo_token,
-            service_name,
-            service_number,
-            service_job_id,
-            service_pull_request,
-            commit_sha,
-            false,
-            output_path,
-            vcs_branch,
-            is_parallel,
-            demangle,
-        );
-    } else if output_type == "coveralls+" {
-        output_coveralls(
-            iterator,
-            repo_token,
-            service_name,
-            service_number,
-            service_job_id,
-            service_pull_request,
-            commit_sha,
-            true,
-            output_path,
-            vcs_branch,
-            is_parallel,
-            demangle,
-        );
-    } else if output_type == "files" {
-        output_files(iterator, output_path);
-    } else if output_type == "covdir" {
-        output_covdir(iterator, output_path);
-    } else if output_type == "html" {
-        output_html(iterator, output_path, num_threads, branch_enabled);
-    } else if output_type == "cobertura" {
-        output_cobertura(iterator, output_path, demangle);
-    } else {
-        assert!(false, "{} is not a supported output type", output_type);
+    let service_number = opt.service_number.unwrap_or_default();
+    let service_pull_request = opt.service_pull_request.unwrap_or_default();
+    let commit_sha = opt.commit_sha.unwrap_or_default();
+
+    let output_types = opt.output_types;
+
+    let output_path = match output_types.len() {
+        0 => unreachable!("Output types has a default value"),
+        1 => opt.output_path.as_deref(),
+        _ => match opt.output_path.as_deref() {
+            Some(output_path) => {
+                if output_path.is_dir() {
+                    Some(output_path)
+                } else {
+                    panic!("output_path must be a directory when using multiple outputs");
+                }
+            }
+            _ => None,
+        },
+    };
+
+    for output_type in &output_types {
+        let output_path = output_type.to_file_name(output_path);
+        let results = if opt.sort_output_types.contains(output_type) {
+            // compute and cache the sorted results if not already used
+            sorted_iterator = sorted_iterator.or_else(|| {
+                let mut results = iterator.clone();
+                results.sort_by_key(|result| result.0.display().to_string());
+                Some(results)
+            });
+            sorted_iterator.as_ref().unwrap()
+        } else {
+            &iterator
+        };
+
+        match output_type {
+            OutputType::Ade => output_activedata_etl(results, output_path.as_deref(), demangle),
+            OutputType::Lcov => output_lcov(results, output_path.as_deref(), demangle),
+            OutputType::Coveralls => output_coveralls(
+                results,
+                opt.token.as_deref(),
+                opt.service_name.as_deref(),
+                &service_number,
+                opt.service_job_id.as_deref(),
+                &service_pull_request,
+                opt.service_flag_name.as_deref(),
+                &commit_sha,
+                false,
+                output_path.as_deref(),
+                &opt.vcs_branch,
+                opt.parallel,
+                demangle,
+            ),
+            OutputType::CoverallsPlus => output_coveralls(
+                results,
+                opt.token.as_deref(),
+                opt.service_name.as_deref(),
+                &service_number,
+                opt.service_job_id.as_deref(),
+                &service_pull_request,
+                opt.service_flag_name.as_deref(),
+                &commit_sha,
+                true,
+                output_path.as_deref(),
+                &opt.vcs_branch,
+                opt.parallel,
+                demangle,
+            ),
+            OutputType::Files => output_files(results, output_path.as_deref()),
+            OutputType::Covdir => output_covdir(results, output_path.as_deref(), opt.precision),
+            OutputType::Html => output_html(
+                results,
+                output_path.as_deref(),
+                num_threads,
+                opt.branch,
+                opt.output_config_file.as_deref(),
+                opt.precision,
+            ),
+            OutputType::Cobertura => output_cobertura(
+                source_root.as_deref(),
+                results,
+                output_path.as_deref(),
+                demangle,
+                false,
+            ),
+            OutputType::CoberturaPretty => output_cobertura(
+                source_root.as_deref(),
+                results,
+                output_path.as_deref(),
+                demangle,
+                true,
+            ),
+            OutputType::Markdown => output_markdown(results, output_path.as_deref(), opt.precision),
+        };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use clap::CommandFactory;
+
+    #[test]
+    fn clap_debug_assert() {
+        Opt::command().debug_assert();
     }
 }

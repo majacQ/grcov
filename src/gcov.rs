@@ -1,20 +1,21 @@
+use lazy_static::lazy_static;
 use semver::Version;
 use std::env;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::Path;
 use std::process::Command;
 
 #[derive(Debug)]
-pub enum GcovError {
+pub enum GcovToolError {
     ProcessFailure,
     Failure((String, String, String)),
 }
 
-impl fmt::Display for GcovError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl fmt::Display for GcovToolError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            GcovError::ProcessFailure => write!(f, "Failed to execute gcov process"),
-            GcovError::Failure((ref path, ref stdout, ref stderr)) => {
+            GcovToolError::ProcessFailure => write!(f, "Failed to execute gcov process"),
+            GcovToolError::Failure((ref path, ref stdout, ref stderr)) => {
                 writeln!(f, "gcov execution failed on {}", path)?;
                 writeln!(f, "gcov stdout: {}", stdout)?;
                 writeln!(f, "gcov stderr: {}", stderr)
@@ -32,11 +33,11 @@ fn get_gcov() -> String {
 }
 
 pub fn run_gcov(
-    gcno_path: &PathBuf,
+    gcno_path: &Path,
     branch_enabled: bool,
-    working_dir: &PathBuf,
-) -> Result<(), GcovError> {
-    let mut command = Command::new(&get_gcov());
+    working_dir: &Path,
+) -> Result<(), GcovToolError> {
+    let mut command = Command::new(get_gcov());
     let command = if branch_enabled {
         command.arg("-b").arg("-c")
     } else {
@@ -50,11 +51,11 @@ pub fn run_gcov(
     let output = if let Ok(output) = status.output() {
         output
     } else {
-        return Err(GcovError::ProcessFailure);
+        return Err(GcovToolError::ProcessFailure);
     };
 
     if !output.status.success() {
-        return Err(GcovError::Failure((
+        return Err(GcovToolError::Failure((
             gcno_path.to_str().unwrap().to_string(),
             String::from_utf8_lossy(&output.stdout).to_string(),
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -67,7 +68,7 @@ pub fn run_gcov(
 pub fn get_gcov_version() -> &'static Version {
     lazy_static! {
         static ref V: Version = {
-            let output = Command::new(&get_gcov())
+            let output = Command::new(get_gcov())
                 .arg("--version")
                 .output()
                 .expect("Failed to execute `gcov`. `gcov` is required (it is part of GCC).");
@@ -82,13 +83,7 @@ pub fn get_gcov_version() -> &'static Version {
 pub fn get_gcov_output_ext() -> &'static str {
     lazy_static! {
         static ref E: &'static str = {
-            let min_ver = Version {
-                major: 9,
-                minor: 1,
-                patch: 0,
-                pre: vec![],
-                build: vec![],
-            };
+            let min_ver = Version::new(9, 1, 0);
             if get_gcov_version() >= &min_ver {
                 ".gcov.json.gz"
             } else {
@@ -100,13 +95,13 @@ pub fn get_gcov_output_ext() -> &'static str {
 }
 
 fn parse_version(gcov_output: &str) -> Version {
-    let mut versions: Vec<_> = gcov_output
-        .split(|c| c == ' ' || c == '\n')
-        .filter_map(|value| Version::parse(value).ok())
-        .collect();
-    assert!(!versions.is_empty(), "no version found for `gcov`.");
+    let version = gcov_output
+        .split([' ', '\n'])
+        .filter_map(|value| Version::parse(value.trim()).ok())
+        .last();
+    assert!(version.is_some(), "no version found for `gcov`.");
 
-    versions.pop().unwrap()
+    version.unwrap()
 }
 
 #[cfg(test)]
@@ -117,33 +112,17 @@ mod tests {
     fn test_parse_version() {
         assert_eq!(
             parse_version("gcov (Ubuntu 4.3.0-12ubuntu2) 4.3.0 20170406"),
-            Version {
-                major: 4,
-                minor: 3,
-                patch: 0,
-                pre: vec![],
-                build: vec![],
-            }
+            Version::new(4, 3, 0)
         );
         assert_eq!(
             parse_version("gcov (Ubuntu 4.9.0-12ubuntu2) 4.9.0 20170406"),
-            Version {
-                major: 4,
-                minor: 9,
-                patch: 0,
-                pre: vec![],
-                build: vec![],
-            }
+            Version::new(4, 9, 0)
         );
         assert_eq!(
             parse_version("gcov (Ubuntu 6.3.0-12ubuntu2) 6.3.0 20170406"),
-            Version {
-                major: 6,
-                minor: 3,
-                patch: 0,
-                pre: vec![],
-                build: vec![],
-            }
+            Version::new(6, 3, 0)
         );
+        assert_eq!(parse_version("gcov (GCC) 12.2.0"), Version::new(12, 2, 0));
+        assert_eq!(parse_version("gcov (GCC) 12.2.0\r"), Version::new(12, 2, 0));
     }
 }
